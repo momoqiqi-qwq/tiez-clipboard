@@ -637,12 +637,12 @@ impl SqliteClipboardRepository {
             if let Ok(limit) = limit_str.parse::<i32>() {
                 // Rows past the newest `limit` unpinned/untagged ones are the overflow;
                 // `LIMIT -1 OFFSET` selects them in one pass instead of COUNT + a second scan.
-                let deleted_ids: Vec<i64> = {
+                let mut deleted_ids: Vec<i64> = {
                     let mut stmt = conn
                         .prepare(
                             "SELECT id FROM clipboard_history
                              WHERE is_pinned = 0 AND (tags = '[]' OR tags IS NULL)
-                             ORDER BY timestamp ASC
+                             ORDER BY timestamp DESC
                              LIMIT -1 OFFSET ?",
                         )
                         .map_err(|e| e.to_string())?;
@@ -652,6 +652,8 @@ impl SqliteClipboardRepository {
                         .map_err(|e| e.to_string())?;
                     rows.filter_map(|r| r.ok()).collect()
                 };
+                // Restore the oldest-first order the previous ASC/LIMIT query returned.
+                deleted_ids.reverse();
 
                 if deleted_ids.is_empty() {
                     return Ok(Vec::new());
