@@ -488,12 +488,12 @@ const App = () => {
     virtualListRef.current?.scrollToItem(0);
   }, []);
 
-  const toggleGroup = (group: string) => {
+  const toggleGroup = useCallback((group: string) => {
     setCollapsedGroups(prev => ({
       ...prev,
       [group]: !prev[group],
     }));
-  };
+  }, []);
 
   const hotkeyParts = useMemo(
     () => (hotkey || '').split('+').map((part) => part.trim()).filter(Boolean),
@@ -772,14 +772,15 @@ const App = () => {
 
   useEffect(() => {
     let cancelled = false;
+
+    // Updater form keeps {} referentially identical; a fresh object here re-rendered the whole app per copy.
+    if (quickPasteModifier === "disabled") {
+      setQuickPasteHintsById((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+      return;
+    }
+
     const seededHints = buildQuickPasteHintsById(history, quickPasteModifier);
     setQuickPasteHintsById(seededHints);
-
-    if (quickPasteModifier === "disabled") {
-      return () => {
-        cancelled = true;
-      };
-    }
 
     invoke<ClipboardEntry[]>("get_clipboard_history", {
       limit: 256,

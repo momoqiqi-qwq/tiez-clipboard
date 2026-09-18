@@ -23,8 +23,17 @@ interface TagInfo {
 const OFFICIAL_TAGS = ['sensitive', '密码', '网站', '手机号', '邮箱', 'apikey', '网盘'];
 const isOfficialTag = (name: string) => OFFICIAL_TAGS.includes(name);
 
+const TAG_MANAGER_VIEW_MODE_KEY = "tiez_tag_manager_view_mode";
+
+const formatItemDate = (timestamp: number) => {
+    const date = new Date(timestamp);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+};
+
 export default function TagManager({ t, theme }: TagManagerProps) {
-    const TAG_MANAGER_VIEW_MODE_KEY = "tiez_tag_manager_view_mode";
     const [tags, setTags] = useState<TagInfo[]>([]);
     const [tagSearch, setTagSearch] = useState('');
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
@@ -263,18 +272,14 @@ export default function TagManager({ t, theme }: TagManagerProps) {
     const canCreateTag = normalizedTagSearch.length > 0
         && !tags.some(tag => tag.name.toLowerCase() === normalizedTagSearch);
 
-    const sortedItems = [...tagItems].sort((a, b) => {
-        if (sortBy === 'count') return (b.use_count || 0) - (a.use_count || 0);
-        return b.timestamp - a.timestamp;
-    });
-
-    const formatItemDate = (timestamp: number) => {
-        const date = new Date(timestamp);
-        const year = date.getFullYear();
-        const month = String(date.getMonth() + 1).padStart(2, '0');
-        const day = String(date.getDate()).padStart(2, '0');
-        return `${year}-${month}-${day}`;
-    };
+    const sortedItems = useMemo(() => {
+        const items = [...tagItems];
+        items.sort((a, b) => {
+            if (sortBy === 'count') return (b.use_count || 0) - (a.use_count || 0);
+            return b.timestamp - a.timestamp;
+        });
+        return items;
+    }, [tagItems, sortBy]);
 
     return (
         <div

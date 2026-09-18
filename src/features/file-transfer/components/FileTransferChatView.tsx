@@ -25,9 +25,86 @@ import type {
     FileTransferMessage,
     FileTransferDevice
 } from "../types";
-import { debugLog } from "../../../shared/lib/debug";
+import { debugLog, isDebugLogging } from "../../../shared/lib/debug";
 
 // File Transfer Chat View Component
+const URL_REGEX = /((https?:\/\/|www\.)[^\s<]+|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,})(?:\/[^\s<]*)?)/gi;
+
+const normalizeUrl = (raw: string) => {
+    if (/^https?:\/\//i.test(raw)) return raw;
+    return `http://${raw}`;
+};
+
+const splitTrailingPunctuation = (raw: string) => {
+    let url = raw;
+    let trailing = '';
+    while (url.length > 0 && /[)\]}>.,;!?]$/.test(url)) {
+        trailing = url.slice(-1) + trailing;
+        url = url.slice(0, -1);
+    }
+    return { url, trailing };
+};
+
+const renderTextWithLinks = (text: string) => {
+    const parts: ReactNode[] = [];
+    let lastIndex = 0;
+
+    text.replace(URL_REGEX, (match, _group, _proto, offset) => {
+        if (match.includes('@')) {
+            return match;
+        }
+        const prevChar = offset > 0 ? text[offset - 1] : '';
+        if (prevChar && /[a-z0-9@]/i.test(prevChar)) {
+            return match;
+        }
+        if (offset > lastIndex) {
+            parts.push(text.slice(lastIndex, offset));
+        }
+
+        const { url, trailing } = splitTrailingPunctuation(match);
+        const href = normalizeUrl(url);
+
+        parts.push(
+            <a
+                key={`link-${offset}`}
+                href={href}
+                className="wt-link"
+                onClick={(e) => {
+                    e.preventDefault();
+                    if (window.getSelection()?.toString()) return;
+                    invoke('open_content', { id: 0, content: href, contentType: 'url' }).catch(console.error);
+                }}
+            >
+                {url}
+            </a>
+        );
+
+        if (trailing) {
+            parts.push(trailing);
+        }
+
+        lastIndex = offset + match.length;
+        return match;
+    });
+
+    if (lastIndex < text.length) {
+        parts.push(text.slice(lastIndex));
+    }
+
+    return parts.length > 0 ? parts : text;
+};
+
+const PEER_AVATAR_GRADIENTS = [
+    'var(--wt-peer-gradient-1)',
+    'var(--wt-peer-gradient-2)',
+    'var(--wt-peer-gradient-3)',
+    'var(--wt-peer-gradient-4)',
+    'var(--wt-peer-gradient-5)',
+    'var(--wt-peer-gradient-6)',
+    'var(--wt-peer-gradient-7)',
+    'var(--wt-peer-gradient-8)'
+];
+
 const FileTransferChatView = ({
     t,
     localIp,
@@ -64,72 +141,6 @@ const FileTransferChatView = ({
         ['--wt-side-width']: `${composerSideWidth}px`,
         ['--wt-footer-padding-y']: `${composerMetrics.footerPaddingY}px`
     } as CSSProperties;
-
-    const URL_REGEX = /((https?:\/\/|www\.)[^\s<]+|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,})(?:\/[^\s<]*)?)/gi;
-
-    const normalizeUrl = (raw: string) => {
-        if (/^https?:\/\//i.test(raw)) return raw;
-        return `http://${raw}`;
-    };
-
-    const splitTrailingPunctuation = (raw: string) => {
-        let url = raw;
-        let trailing = '';
-        while (url.length > 0 && /[)\]}>.,;!?]$/.test(url)) {
-            trailing = url.slice(-1) + trailing;
-            url = url.slice(0, -1);
-        }
-        return { url, trailing };
-    };
-
-    const renderTextWithLinks = (text: string) => {
-        const parts: ReactNode[] = [];
-        let lastIndex = 0;
-
-        text.replace(URL_REGEX, (match, _group, _proto, offset) => {
-            if (match.includes('@')) {
-                return match;
-            }
-            const prevChar = offset > 0 ? text[offset - 1] : '';
-            if (prevChar && /[a-z0-9@]/i.test(prevChar)) {
-                return match;
-            }
-            if (offset > lastIndex) {
-                parts.push(text.slice(lastIndex, offset));
-            }
-
-            const { url, trailing } = splitTrailingPunctuation(match);
-            const href = normalizeUrl(url);
-
-            parts.push(
-                <a
-                    key={`link-${offset}`}
-                    href={href}
-                    className="wt-link"
-                    onClick={(e) => {
-                        e.preventDefault();
-                        if (window.getSelection()?.toString()) return;
-                        invoke('open_content', { id: 0, content: href, contentType: 'url' }).catch(console.error);
-                    }}
-                >
-                    {url}
-                </a>
-            );
-
-            if (trailing) {
-                parts.push(trailing);
-            }
-
-            lastIndex = offset + match.length;
-            return match;
-        });
-
-        if (lastIndex < text.length) {
-            parts.push(text.slice(lastIndex));
-        }
-
-        return parts.length > 0 ? parts : text;
-    };
 
     useEffect(() => {
         invoke("set_navigation_enabled", { enabled: false }).catch(console.error);
@@ -173,23 +184,12 @@ const FileTransferChatView = ({
             };
         }
 
-        const gradients = [
-            'var(--wt-peer-gradient-1)',
-            'var(--wt-peer-gradient-2)',
-            'var(--wt-peer-gradient-3)',
-            'var(--wt-peer-gradient-4)',
-            'var(--wt-peer-gradient-5)',
-            'var(--wt-peer-gradient-6)',
-            'var(--wt-peer-gradient-7)',
-            'var(--wt-peer-gradient-8)'
-        ];
-
         const id = m.sender_id || 'mobile';
         let hash = 0;
         for (let i = 0; i < id.length; i++) {
             hash = id.charCodeAt(i) + ((hash << 5) - hash);
         }
-        const gradient = gradients[Math.abs(hash) % gradients.length];
+        const gradient = PEER_AVATAR_GRADIENTS[Math.abs(hash) % PEER_AVATAR_GRADIENTS.length];
 
         let initial = 'M';
         if (m.sender_name) {
@@ -242,7 +242,7 @@ const FileTransferChatView = ({
         const handleDragDrop = (event: { payload: unknown }) => {
             debugLog("[DRAG] Drop event received:", event);
             debugLog("[DRAG] Event payload type:", typeof event.payload);
-            debugLog("[DRAG] Event payload:", JSON.stringify(event.payload, null, 2));
+            if (isDebugLogging) debugLog("[DRAG] Event payload:", JSON.stringify(event.payload, null, 2));
             setIsDragging(false);
 
             const paths = resolveDropPaths(event.payload);

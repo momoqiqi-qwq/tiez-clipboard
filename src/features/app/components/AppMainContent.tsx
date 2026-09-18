@@ -189,6 +189,59 @@ const AppMainContent = ({
     handlePinnedReorder(finalIds);
   }, [handlePinnedReorder, pinnedItems]);
 
+  const pinnedHeader = useMemo(
+    () =>
+      pinnedItems.length > 0 ? (
+        <Reorder.Group
+          axis="y"
+          values={orderedPinnedIds}
+          onReorder={handlePinnedIdsReorder}
+          className={isDraggingPinned ? "pinned-reorder dragging" : "pinned-reorder"}
+          style={{ listStyle: "none", padding: 0 }}
+        >
+          {orderedPinnedItems.map((item, index) => (
+            <SortableItem
+              key={item.id}
+              item={item}
+              index={index}
+              renderItem={renderItemContent}
+              isFirst={index === 0}
+              compactMode={compactMode}
+              onDragStart={handlePinnedDragStart}
+              onDragEnd={handlePinnedDragEnd}
+            />
+          ))}
+        </Reorder.Group>
+      ) : null,
+    [
+      pinnedItems.length,
+      orderedPinnedIds,
+      handlePinnedIdsReorder,
+      isDraggingPinned,
+      orderedPinnedItems,
+      renderItemContent,
+      compactMode,
+      handlePinnedDragStart,
+      handlePinnedDragEnd
+    ]
+  );
+
+  // Virtuoso re-renders every visible row when itemContent changes identity.
+  const virtualRenderItem = useCallback(
+    (item: ClipboardEntry, index: number, isFirst?: boolean) => {
+      const el = renderItemContent(item, pinnedItems.length + index, undefined, true);
+      if (isFirst && pinnedItems.length === 0) {
+        return (
+          <div className="first-virtual-item" style={{ height: "100%", paddingTop: "4px" }}>
+            {el}
+          </div>
+        );
+      }
+      return el;
+    },
+    [renderItemContent, pinnedItems.length]
+  );
+
   if (showTagManager && tagManagerEnabled) {
     return (
       <motion.div
@@ -288,41 +341,8 @@ const AppMainContent = ({
             compactMode={compactMode}
             selectedIndex={selectedIndex - pinnedItems.length}
             isKeyboardMode={isKeyboardMode}
-            header={
-              pinnedItems.length > 0 ? (
-                <Reorder.Group
-                  axis="y"
-                  values={orderedPinnedIds}
-                  onReorder={handlePinnedIdsReorder}
-                  className={isDraggingPinned ? "pinned-reorder dragging" : "pinned-reorder"}
-                  style={{ listStyle: "none", padding: 0 }}
-                >
-                  {orderedPinnedItems.map((item, index) => (
-                    <SortableItem
-                      key={item.id}
-                      item={item}
-                      index={index}
-                      renderItem={renderItemContent}
-                      isFirst={index === 0}
-                      compactMode={compactMode}
-                      onDragStart={handlePinnedDragStart}
-                      onDragEnd={handlePinnedDragEnd}
-                    />
-                  ))}
-                </Reorder.Group>
-              ) : null
-            }
-            renderItem={(item, index, isFirst?: boolean) => {
-              const el = renderItemContent(item, pinnedItems.length + index, undefined, true);
-              if (isFirst && pinnedItems.length === 0) {
-                return (
-                  <div className="first-virtual-item" style={{ height: "100%", paddingTop: "4px" }}>
-                    {el}
-                  </div>
-                );
-              }
-              return el;
-            }}
+            header={pinnedHeader}
+            renderItem={virtualRenderItem}
             onLoadMore={loadMoreHistory}
             onScroll={handleListScroll}
             hasMore={hasMore}

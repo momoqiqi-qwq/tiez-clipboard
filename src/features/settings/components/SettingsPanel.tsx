@@ -1,5 +1,5 @@
 
-import { memo, useState, useEffect, useCallback } from "react";
+import { memo, useState, useEffect, useCallback, useContext, useMemo, createContext } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -25,6 +25,44 @@ import SettingsFooter from "./SettingsFooter";
 import ThemeStorePanel from "../../theme-store/components/ThemeStorePanel";
 import { CLOUD_SYNC_ENABLED } from "../../../shared/config/edition";
 import { debugLog } from "../../../shared/lib/debug";
+
+interface HintState {
+    openHints: Set<string>;
+    toggleHint: (key: string) => void;
+}
+
+const HintsContext = createContext<HintState>({
+    openHints: new Set<string>(),
+    toggleHint: () => {},
+});
+
+// Module scope: an inner definition changed identity every render and remounted all ~40 hint subtrees.
+const LabelWithHint = ({ label, hint, hintKey }: { label: string; hint?: string | React.ReactNode; hintKey: string }) => {
+    const { openHints, toggleHint } = useContext(HintsContext);
+    return (
+        <div className="item-label-group">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span className="item-label">{label}</span>
+                {hint && (
+                    <button
+                        type="button"
+                        className="hint-icon-btn"
+                        title={typeof hint === 'string' ? hint : undefined}
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            toggleHint(hintKey);
+                        }}
+                    >
+                        <HelpCircle size={12} />
+                    </button>
+                )}
+            </div>
+            {hint && openHints.has(hintKey) && (
+                typeof hint === 'string' ? <span className="hint">{hint}</span> : hint
+            )}
+        </div>
+    );
+};
 
 interface SettingsPanelProps {
     t: (key: string) => string;
@@ -320,38 +358,16 @@ const SettingsPanel = (props: SettingsPanelProps) => {
         }
     };
 
-    const toggleHint = (key: string) => {
+    const toggleHint = useCallback((key: string) => {
         setOpenHints(prev => {
             const next = new Set(prev);
             if (next.has(key)) next.delete(key);
             else next.add(key);
             return next;
         });
-    };
+    }, []);
 
-    const LabelWithHint = ({ label, hint, hintKey }: { label: string; hint?: string | React.ReactNode; hintKey: string }) => (
-        <div className="item-label-group">
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span className="item-label">{label}</span>
-                {hint && (
-                    <button
-                        type="button"
-                        className="hint-icon-btn"
-                        title={typeof hint === 'string' ? hint : undefined}
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            toggleHint(hintKey);
-                        }}
-                    >
-                        <HelpCircle size={12} />
-                    </button>
-                )}
-            </div>
-            {hint && openHints.has(hintKey) && (
-                typeof hint === 'string' ? <span className="hint">{hint}</span> : hint
-            )}
-        </div>
-    );
+    const hintsValue = useMemo(() => ({ openHints, toggleHint }), [openHints, toggleHint]);
 
     const checkModelStatus = async (profile: AiProfile) => {
         setProfileStatuses(prev => ({ ...prev, [profile.id]: 'loading' }));
@@ -464,6 +480,7 @@ const SettingsPanel = (props: SettingsPanelProps) => {
     }, [setSettingsSubpage]);
 
     return (
+        <HintsContext.Provider value={hintsValue}>
         <motion.div
             initial={{ opacity: 0, x: 20 }}
             animate={{ opacity: 1, x: 0 }}
@@ -830,6 +847,7 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 </>
             )}
         </motion.div>
+        </HintsContext.Provider>
     );
 };
 

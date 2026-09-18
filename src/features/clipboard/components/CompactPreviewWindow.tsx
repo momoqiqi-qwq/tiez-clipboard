@@ -21,7 +21,7 @@ import { getConciseTime } from "../../../shared/lib/utils";
 import type { Locale } from "../../../shared/types";
 import { toTauriLocalImageSrc } from "../../../shared/lib/localImageSrc";
 import { getRichTextSnapshotDataUrl } from "../../../shared/lib/richTextSnapshot";
-import { debugLog } from "../../../shared/lib/debug";
+import { debugLog, isDebugLogging } from "../../../shared/lib/debug";
 
 type PreviewPayload = {
     contentType: string;
@@ -88,6 +88,7 @@ const isSpreadsheetLikeSource = (sourceApp?: string): boolean => {
 
 const RICH_PREVIEW_DEBUG = import.meta.env.DEV;
 const compactPreviewLog = (...args: unknown[]) => {
+    if (!isDebugLogging) return;
     const ts = new Date().toISOString();
     debugLog(`[CompactPreview][Preview][${ts}]`, ...args);
 };

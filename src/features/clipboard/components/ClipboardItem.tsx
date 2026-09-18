@@ -43,7 +43,7 @@ import { getRichTextSnapshotDataUrl } from "../../../shared/lib/richTextSnapshot
 import { getFileIcon as getSystemFileIcon, peekFileIcon } from "../../../shared/lib/fileIcon";
 import { getSourceAppIcon, peekSourceAppIcon } from "../../../shared/lib/sourceAppIcon";
 import { registerCompactPreviewControls } from "../lib/compactPreviewControls";
-import { debugLog } from "../../../shared/lib/debug";
+import { debugLog, isDebugLogging } from "../../../shared/lib/debug";
 
 const COMPACT_PREVIEW_LABEL = "compact-preview";
 const RICH_IMAGE_FALLBACK_PREFIX = "<!--TIEZ_RICH_IMAGE:";
@@ -58,6 +58,7 @@ const IS_MACOS =
 const COMPACT_PREVIEW_WINDOW_SUPPORTED = true;
 const COMPACT_PREVIEW_WARMUP_SUPPORTED = !IS_MACOS;
 const compactPreviewLog = (...args: unknown[]) => {
+    if (!isDebugLogging) return;
     const ts = new Date().toISOString();
     debugLog(`[CompactPreview][Main][${ts}]`, ...args);
 };
