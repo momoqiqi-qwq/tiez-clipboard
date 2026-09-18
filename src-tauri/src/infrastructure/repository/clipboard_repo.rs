@@ -635,37 +635,40 @@ impl SqliteClipboardRepository {
         if let Ok(Some(limit_str)) = SqliteSettingsRepository::get_raw(conn, "app.persistent_limit")
         {
             if let Ok(limit) = limit_str.parse::<i32>() {
-                // Count non-pinned entries
-                let count: i32 = conn.query_row(
-                    "SELECT COUNT(*) FROM clipboard_history WHERE is_pinned = 0 AND (tags = '[]' OR tags IS NULL)",
-                    [],
-                    |row| row.get(0)
-                ).map_err(|e| e.to_string())?;
-
-                if count > limit {
-                    // First, get the IDs that will be deleted
-                    let to_delete = count - limit;
-                    let deleted_ids: Vec<i64> = {
-                        let mut stmt = conn
-                            .prepare(
-                                "SELECT id FROM clipboard_history 
+                // Rows past the newest `limit` unpinned/untagged ones are the overflow;
+                // `LIMIT -1 OFFSET` selects them in one pass instead of COUNT + a second scan.
+                let deleted_ids: Vec<i64> = {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id FROM clipboard_history
                              WHERE is_pinned = 0 AND (tags = '[]' OR tags IS NULL)
-                             ORDER BY timestamp ASC 
-                             LIMIT ?",
-                            )
-                            .map_err(|e| e.to_string())?;
+                             ORDER BY timestamp ASC
+                             LIMIT -1 OFFSET ?",
+                        )
+                        .map_err(|e| e.to_string())?;
 
-                        let rows = stmt
-                            .query_map([to_delete], |row| row.get(0))
-                            .map_err(|e| e.to_string())?;
-                        rows.filter_map(|r| r.ok()).collect()
-                    };
-                    // Actually delete records (and files if needed)
-                    for id in &deleted_ids {
-                        let _ = self.delete_with_conn(conn, *id, data_dir);
-                    }
-                    return Ok(deleted_ids);
+                    let rows = stmt
+                        .query_map([limit], |row| row.get(0))
+                        .map_err(|e| e.to_string())?;
+                    rows.filter_map(|r| r.ok()).collect()
+                };
+
+                if deleted_ids.is_empty() {
+                    return Ok(Vec::new());
                 }
+
+                // One transaction for the whole batch: each autocommitted DELETE forced its
+                // own fsync, and overflow pruning runs on every copy.
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .map_err(|e| e.to_string())?;
+                for id in &deleted_ids {
+                    let _ = self.delete_with_conn(conn, *id, data_dir);
+                }
+                if let Err(e) = conn.execute_batch("COMMIT") {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e.to_string());
+                }
+                return Ok(deleted_ids);
             }
         }
 
@@ -869,6 +872,12 @@ impl SqliteClipboardRepository {
     }
 }
 
+/// `needle` is already lowercased. Try the allocation-free match first and only
+/// fall back to full case folding when it misses.
+fn contains_lower(haystack: &str, needle: &str) -> bool {
+    haystack.contains(needle) || haystack.to_lowercase().contains(needle)
+}
+
 impl ClipboardRepository for SqliteClipboardRepository {
     fn save(
         &self,
@@ -896,6 +905,10 @@ impl ClipboardRepository for SqliteClipboardRepository {
             let content = self.maybe_decrypt_text(&content_raw);
             let preview = self.maybe_decrypt_text(&preview_raw);
             let html_content = html_raw.as_ref().map(|v| self.maybe_decrypt_text(v));
+            let html_encrypted = html_raw
+                .as_ref()
+                .map(|h| h.starts_with(ENCRYPT_PREFIX))
+                .unwrap_or(false);
 
             Ok((
                 ClipboardEntry {
@@ -916,9 +929,11 @@ impl ClipboardRepository for SqliteClipboardRepository {
                     // Missing files are still handled by frontend image/file preview error fallback.
                     file_preview_exists: true,
                 },
-                content_raw,
-                preview_raw,
-                html_raw,
+                // Flags only: raw column copies would double peak memory on base64 image pages.
+                content_raw.starts_with(ENCRYPT_PREFIX),
+                preview_raw.starts_with(ENCRYPT_PREFIX),
+                html_encrypted,
+                html_raw.is_some() && !html_encrypted,
             ))
         };
 
@@ -952,21 +967,13 @@ impl ClipboardRepository for SqliteClipboardRepository {
             }
         }
 
-        let mut history = Vec::new();
-        for (entry, content_raw, preview_raw, html_raw) in mapped_rows {
+        let mut history = Vec::with_capacity(mapped_rows.len());
+        for (entry, content_encrypted, preview_encrypted, html_encrypted, html_needs_encrypt) in
+            mapped_rows
+        {
             #[cfg(not(feature = "portable"))]
             {
                 let is_sensitive = has_sensitive_tag(&entry.tags);
-                let content_encrypted = content_raw.starts_with(ENCRYPT_PREFIX);
-                let preview_encrypted = preview_raw.starts_with(ENCRYPT_PREFIX);
-                let html_encrypted = html_raw
-                    .as_ref()
-                    .map(|h| h.starts_with(ENCRYPT_PREFIX))
-                    .unwrap_or(false);
-                let html_needs_encrypt = html_raw
-                    .as_ref()
-                    .map(|h| !h.starts_with(ENCRYPT_PREFIX))
-                    .unwrap_or(false);
 
                 if is_sensitive && (!content_encrypted || !preview_encrypted || html_needs_encrypt)
                 {
@@ -1189,8 +1196,8 @@ impl ClipboardRepository for SqliteClipboardRepository {
                     sensitive_tags_sql
                 );
 
+                let mut stmt = conn.prepare(&sql_sensitive).map_err(|e| e.to_string())?;
                 loop {
-                    let mut stmt = conn.prepare(&sql_sensitive).map_err(|e| e.to_string())?;
                     let rows = stmt
                         .query_map(params![enc_like, cursor_ts, cursor_id, batch_size], |row| {
                             let tags_str: String = row.get(8).unwrap_or_else(|_| "[]".to_string());
@@ -1229,17 +1236,22 @@ impl ClipboardRepository for SqliteClipboardRepository {
                         break;
                     }
 
-                    for entry in batch.iter() {
+                    let (last_ts, last_id) = match batch.last() {
+                        Some(last) => (last.timestamp, last.id),
+                        None => break,
+                    };
+
+                    for entry in batch {
                         let matches = if tag_only {
-                            entry.tags.iter().any(|t| t.to_lowercase().contains(&term))
+                            entry.tags.iter().any(|t| contains_lower(t, &term))
                         } else {
-                            entry.content.to_lowercase().contains(&term)
-                                || entry.source_app.to_lowercase().contains(&term)
-                                || entry.tags.iter().any(|t| t.to_lowercase().contains(&term))
+                            contains_lower(&entry.content, &term)
+                                || contains_lower(&entry.source_app, &term)
+                                || entry.tags.iter().any(|t| contains_lower(t, &term))
                         };
 
                         if matches && seen.insert(entry.id) {
-                            results.push(entry.clone());
+                            results.push(entry);
                             if results.len() >= limit as usize {
                                 break;
                             }
@@ -1250,12 +1262,8 @@ impl ClipboardRepository for SqliteClipboardRepository {
                         break;
                     }
 
-                    if let Some(last) = batch.last() {
-                        cursor_ts = last.timestamp;
-                        cursor_id = last.id;
-                    } else {
-                        break;
-                    }
+                    cursor_ts = last_ts;
+                    cursor_id = last_id;
                 }
             }
 
@@ -1273,24 +1281,31 @@ impl ClipboardRepository for SqliteClipboardRepository {
     }
 
     fn clear(&self, data_dir: Option<&std::path::Path>) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
 
-        // Get IDs of unpinned items without tags.
-        let mut stmt = conn
-            .prepare(
-                "SELECT id FROM clipboard_history 
-             WHERE is_pinned = 0 
-               AND NOT EXISTS (SELECT 1 FROM entry_tags WHERE entry_id = clipboard_history.id)",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?;
-        let ids: Vec<i64> = rows.filter_map(Result::ok).collect();
+        let ids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM clipboard_history
+                 WHERE is_pinned = 0
+                   AND NOT EXISTS (SELECT 1 FROM entry_tags WHERE entry_id = clipboard_history.id)",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(Result::ok).collect()
+        };
 
-        // Delete one-by-one so tombstones are recorded for cloud deletion sync.
-        for id in &ids {
-            self.delete_with_conn(&conn, *id, data_dir)?;
+        // Delete one-by-one so tombstones are recorded for cloud deletion sync, but in a
+        // single transaction: per-row commits made clearing freeze the UI, and a mid-loop
+        // failure used to leave the history half-cleared.
+        {
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            for id in &ids {
+                self.delete_with_conn(&tx, *id, data_dir)?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
         }
 
         // VACUUM to reclaim space

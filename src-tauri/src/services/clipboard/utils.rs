@@ -2009,11 +2009,13 @@ pub fn app_cleanup_policy_matches(
     false
 }
 
+fn img_src_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(<img\s+[^>]*src=["'])([^"']+)(["'][^>]*>)"#).unwrap())
+}
+
 pub fn embed_local_images(html: &str) -> String {
-    let re = match Regex::new(r#"(<img\s+[^>]*src=["'])([^"']+)(["'][^>]*>)"#) {
-        Ok(r) => r,
-        Err(_) => return html.to_string(),
-    };
+    let re = img_src_regex();
 
     re.replace_all(html, |caps: &regex::Captures| {
         let prefix = &caps[1];
@@ -2094,10 +2096,7 @@ pub fn process_local_images_in_html(html: &str, data_dir: &std::path::Path) -> S
         let _ = std::fs::create_dir_all(&attachments_dir);
     }
 
-    let re = match Regex::new(r#"(<img\s+[^>]*src=["'])([^"']+)(["'][^>]*>)"#) {
-        Ok(r) => r,
-        Err(_) => return html.to_string(),
-    };
+    let re = img_src_regex();
 
     re.replace_all(html, |caps: &regex::Captures| {
         let prefix = &caps[1];
