@@ -1990,6 +1990,11 @@ export default memo(ClipboardItem, (prevProps, nextProps) => {
         prevProps.item.is_external === nextProps.item.is_external &&
         prevProps.item.file_preview_exists === nextProps.item.file_preview_exists &&
         prevProps.item.tags === nextProps.item.tags &&
+        prevProps.isSensitiveHidden === nextProps.isSensitiveHidden &&
+        prevProps.tagColors === nextProps.tagColors &&
+        prevProps.sensitiveMaskPrefixVisible === nextProps.sensitiveMaskPrefixVisible &&
+        prevProps.sensitiveMaskSuffixVisible === nextProps.sensitiveMaskSuffixVisible &&
+        prevProps.sensitiveMaskEmailDomain === nextProps.sensitiveMaskEmailDomain &&
         prevProps.isRevealed === nextProps.isRevealed &&
         prevProps.isEditingTags === nextProps.isEditingTags &&
         prevProps.isAIProcessing === nextProps.isAIProcessing &&

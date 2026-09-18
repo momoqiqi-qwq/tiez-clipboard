@@ -219,7 +219,7 @@ pub async fn paste_next_step(app_handle: tauri::AppHandle) {
                 if id > 0 {
                     // Persistent item: Delete from DB (and cleanup file)
                     let app_data = app_handle.state::<AppDataDir>();
-                    let data_dir = app_data.0.lock().unwrap();
+                    let data_dir = app_data.0.lock().unwrap().clone();
                     if db_state.repo.delete(id, Some(&data_dir)).is_ok() {
                         let _ = app_handle.emit("clipboard-removed", id);
                     }

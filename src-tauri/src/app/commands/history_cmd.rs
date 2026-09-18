@@ -187,7 +187,7 @@ pub fn delete_clipboard_entry(
     }
 
     if id > 0 {
-        let data_dir = app_data.0.lock().unwrap();
+        let data_dir = app_data.0.lock().unwrap().clone();
         state.repo.delete(id, Some(&data_dir))?;
     }
     let _ = app_handle.emit("clipboard-changed", ());
@@ -206,7 +206,7 @@ pub fn clear_clipboard_history(
         let mut session_items = session.inner().0.lock().unwrap();
         session_items.retain(|item| item.is_pinned || !item.tags.is_empty());
     }
-    let data_dir = app_data.0.lock().unwrap();
+    let data_dir = app_data.0.lock().unwrap().clone();
     state.repo.clear(Some(&data_dir)).map_err(AppError::from)?;
     let _ = app_handle.emit("clipboard-changed", ());
     crate::services::cloud_sync::request_cloud_sync(app_handle);
@@ -302,7 +302,7 @@ pub fn delete_tag_from_all(
         session_items.retain(|item| !item.tags.contains(&tag_name));
     }
 
-    let data_dir = app_data.0.lock().unwrap();
+    let data_dir = app_data.0.lock().unwrap().clone();
     state
         .tag_repo
         .delete_globally(&tag_name, Some(&data_dir))

@@ -1360,7 +1360,7 @@ fn handle_post_paste_actions(
 
         // Cleanup file if needed
         let app_data = app_handle.state::<crate::app_state::AppDataDir>();
-        let data_dir = app_data.0.lock().unwrap();
+        let data_dir = app_data.0.lock().unwrap().clone();
 
         if state.repo.delete(id, Some(&data_dir)).is_ok() {
             let _ = app_handle.emit("clipboard-removed", id);
