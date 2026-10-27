@@ -12,7 +12,7 @@
 
   | STARS | VERSION | LICENSE | PLATFORM |
   | :--- | :--- | :--- | :--- |
-  | [![Stars](https://img.shields.io/github/stars/jimuzhe/tiez-clipboard?label=STARS&style=for-the-badge&color=4CAF50)](https://github.com/jimuzhe/tiez-clipboard/stargazers) | [![Version](https://img.shields.io/github/v/release/jimuzhe/tiez-clipboard?label=VERSION&style=for-the-badge&color=2196F3)](https://github.com/jimuzhe/tiez-clipboard/releases) | [![License](https://img.shields.io/badge/LICENSE-GPL--3.0-FF9800?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0) | [![Platform](https://img.shields.io/badge/PLATFORM-WIN%20%2F%20MAC-f44336?style=for-the-badge)](https://github.com/jimuzhe/tiez-clipboard/releases) |
+  | [![Stars](https://img.shields.io/github/stars/momoqiqi-qwq/tiez-clipboard?label=STARS&style=for-the-badge&color=4CAF50)](https://github.com/momoqiqi-qwq/tiez-clipboard/stargazers) | [![Version](https://img.shields.io/github/v/release/momoqiqi-qwq/tiez-clipboard?label=VERSION&style=for-the-badge&color=2196F3)](https://github.com/momoqiqi-qwq/tiez-clipboard/releases) | [![License](https://img.shields.io/badge/LICENSE-GPL--3.0-FF9800?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0) | [![Platform](https://img.shields.io/badge/PLATFORM-WIN%20%2F%20MAC-f44336?style=for-the-badge)](https://github.com/momoqiqi-qwq/tiez-clipboard/releases) |
 
   [English](./README.md) | [简体中文](./README.zh-CN.md)
 </div>
@@ -81,15 +81,15 @@
 | **macOS** | Sierra 10.15+ <br>(Apple Silicon / Intel) | `.dmg` |
 | **Linux** | 即将支持 | 敬请期待 |
 
-[**前往 Releases 下载最新版本 →**](https://github.com/jimuzhe/tiez-clipboard/releases)
+[**前往 Releases 下载最新版本 →**](https://github.com/momoqiqi-qwq/tiez-clipboard/releases)
 
 ---
 
 ## Star History
 
 <div align="center">
-  <a href="https://star-history.com/#jimuzhe/tiez-clipboard&Date">
-    <img src="https://api.star-history.com/svg?repos=jimuzhe/tiez-clipboard&type=Date" alt="Star History Chart" width="800" />
+  <a href="https://star-history.com/#momoqiqi-qwq/tiez-clipboard&Date">
+    <img src="https://api.star-history.com/svg?repos=momoqiqi-qwq/tiez-clipboard&type=Date" alt="Star History Chart" width="800" />
   </a>
 </div>
 

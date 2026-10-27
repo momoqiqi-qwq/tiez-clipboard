@@ -712,6 +712,8 @@ const ClipboardItem = ({
     sensitiveMaskSuffixVisible = 3,
     sensitiveMaskEmailDomain = false,
     quickPasteHint,
+    dragOutEnabled,
+    onStartDragOut,
     dragControls,
     id,
     compactMode,
@@ -1369,6 +1371,7 @@ const ClipboardItem = ({
                                 }
                             }}
                             onKeyDown={(e) => {
+                                if (isComposing.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
                                 if (e.key === 'Escape') {
                                     e.preventDefault();
                                     e.stopPropagation();
@@ -1390,7 +1393,7 @@ const ClipboardItem = ({
                                     setTagSuggestIndex((prev) => (prev <= 0 ? -1 : prev - 1));
                                     return;
                                 }
-                                if (e.key === 'Enter' && !isComposing.current) {
+                                if (e.key === 'Enter') {
                                     e.preventDefault();
                                     e.stopPropagation();
                                     if (
@@ -1500,10 +1503,21 @@ const ClipboardItem = ({
             animate={{ marginBottom: 0 }}
             exit={{ opacity: 0, scale: 0.95 }}
             transition={{ duration: 0.1 }}
-            className={`history-item ${isSelected ? "selected" : ""} ${compactMode ? "compact" : ""} ${item.is_pinned ? "pinned" : ""} ${className || ''}`}
+            className={`history-item ${isSelected ? "selected" : ""} ${compactMode ? "compact" : ""} ${item.is_pinned ? "pinned" : ""} ${dragOutEnabled ? "drag-out-ready" : ""} ${className || ''}`}
             onMouseDown={(e) => {
                 const target = e.target as HTMLElement;
                 if (e.button !== 0) return;
+
+                // 拖拽导出模式：按住条目就把内容落成文件交给 OLE，不做复制。
+                if (dragOutEnabled && !isEditingTags) {
+                    if (target.closest('button, input, textarea, [role="button"], .drag-handle')) return;
+                    if (target.closest('a')) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void hideCompactPreview();
+                    onStartDragOut?.(item);
+                    return;
+                }
 
                 if (isEditingTags) {
                     if (target.closest(".tag-edit-anchor")) return;
@@ -2006,6 +2020,7 @@ export default memo(ClipboardItem, (prevProps, nextProps) => {
         prevProps.quickPasteHint?.slot === nextProps.quickPasteHint?.slot &&
         prevProps.quickPasteHint?.combo === nextProps.quickPasteHint?.combo &&
         prevProps.compactMode === nextProps.compactMode &&
+        prevProps.dragOutEnabled === nextProps.dragOutEnabled &&
         prevProps.theme === nextProps.theme &&
         prevProps.language === nextProps.language &&
         prevProps.tagInput === nextProps.tagInput &&

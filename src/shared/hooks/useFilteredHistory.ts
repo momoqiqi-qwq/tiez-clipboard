@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { parseHistorySearch } from "../lib/historySearch";
 import type { ClipboardEntry } from "../types";
 
 interface UseFilteredHistoryOptions {
@@ -12,20 +13,31 @@ export const useFilteredHistory = ({
   search,
   typeFilter
 }: UseFilteredHistoryOptions) => {
-  return useMemo(() => {
-    const lowerSearch = search.toLowerCase();
+  // Search and type changes do not change ordering. Never sort the state array.
+  const sortedHistory = useMemo(() => {
+    return history.slice().sort((a, b) => {
+      if (a.is_pinned !== b.is_pinned) {
+        return a.is_pinned ? -1 : 1;
+      }
+      if (a.is_pinned) {
+        if ((a.pinned_order || 0) !== (b.pinned_order || 0)) {
+          return (b.pinned_order || 0) - (a.pinned_order || 0);
+        }
+      }
+      return b.timestamp - a.timestamp;
+    });
+  }, [history]);
 
-    const filtered = history.filter((item) => {
+  return useMemo(() => {
+    const { tagOnly: isTagSearch, normalizedTerm: effectiveSearch } = parseHistorySearch(search);
+
+    // Reuse the sorted array when no filtering is needed.
+    if (!typeFilter && !effectiveSearch) return sortedHistory;
+
+    return sortedHistory.filter((item) => {
       if (typeFilter && item.content_type !== typeFilter) {
         return false;
       }
-
-      let effectiveSearch = lowerSearch;
-      const isTagSearch = effectiveSearch.startsWith("tag:");
-      if (isTagSearch) {
-        effectiveSearch = effectiveSearch.slice(4);
-      }
-
       if (!effectiveSearch) return true;
 
       if (isTagSearch) {
@@ -38,18 +50,5 @@ export const useFilteredHistory = ({
         item.tags?.some((tag) => tag.toLowerCase().includes(effectiveSearch))
       );
     });
-
-    return filtered.sort((a, b) => {
-      if (a.is_pinned !== b.is_pinned) {
-        return a.is_pinned ? -1 : 1;
-      }
-      if (a.is_pinned) {
-        if ((a.pinned_order || 0) !== (b.pinned_order || 0)) {
-          return (b.pinned_order || 0) - (a.pinned_order || 0);
-        }
-        return b.timestamp - a.timestamp;
-      }
-      return b.timestamp - a.timestamp;
-    });
-  }, [history, search, typeFilter]);
+  }, [sortedHistory, search, typeFilter]);
 };

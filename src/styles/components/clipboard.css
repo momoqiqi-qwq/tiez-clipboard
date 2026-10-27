@@ -12,3 +12,18 @@
   color: inherit;
   transform: none !important;
 }
+
+/* 拖拽导出模式：按住条目即可把内容拖成文件（拖到文件夹里） */
+.history-item.drag-out-ready {
+  cursor: grab;
+  -webkit-user-drag: none;
+}
+
+.history-item.drag-out-ready:active {
+  cursor: grabbing;
+}
+
+.history-item.drag-out-ready .content-preview-shell,
+.history-item.drag-out-ready .content-preview {
+  cursor: inherit;
+}

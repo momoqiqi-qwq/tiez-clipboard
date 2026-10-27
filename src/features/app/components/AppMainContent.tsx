@@ -7,6 +7,7 @@ import FileTransferChatView from "../../file-transfer/components/FileTransferCha
 import SettingsPanel from "../../settings/components/SettingsPanel";
 import TagManager from "../../tag/components/TagManager";
 import EmojiPanel from "../../emoji/components/EmojiPanel";
+import { useListScrollMemory } from "../../../shared/hooks/useListScrollMemory";
 import { VirtualClipboardList } from "../../clipboard/components/VirtualClipboardList";
 import type { ClipboardEntry } from "../../../shared/types";
 import type { VirtualClipboardListHandle } from "../../clipboard/types";
@@ -37,6 +38,9 @@ interface AppMainContentProps {
   saveSetting: (key: string, val: string) => void;
   filteredHistory: ClipboardEntry[];
   search: string;
+  scrollContextKey: string;
+  scrollLayoutVersion: unknown;
+  suppressEmptyState: boolean;
   pinnedItems: ClipboardEntry[];
   unpinnedItems: ClipboardEntry[];
   compactMode: boolean;
@@ -110,6 +114,9 @@ const AppMainContent = ({
   saveSetting,
   filteredHistory,
   search,
+  scrollContextKey,
+  scrollLayoutVersion,
+  suppressEmptyState,
   pinnedItems,
   unpinnedItems,
   compactMode,
@@ -125,6 +132,7 @@ const AppMainContent = ({
   showScrollTop,
   onScrollTop
 }: AppMainContentProps) => {
+  const { restoreState, remember } = useListScrollMemory(filteredHistory, scrollContextKey, scrollLayoutVersion);
   const [pinnedOrderIds, setPinnedOrderIds] = useState<number[]>(
     () => pinnedItems.map((item) => item.id)
   );
@@ -306,6 +314,8 @@ const AppMainContent = ({
     );
   }
 
+  if (filteredHistory.length === 0 && suppressEmptyState) return null;
+
   if (filteredHistory.length === 0) {
     return (
       <div className="empty-state">
@@ -336,7 +346,10 @@ const AppMainContent = ({
       {filteredHistory.length > 0 && (
         <div className="history-list-container">
           <VirtualClipboardList
+            key={scrollContextKey}
             ref={virtualListRef}
+            restoreStateFrom={restoreState}
+            onStateChange={remember}
             items={unpinnedItems}
             compactMode={compactMode}
             selectedIndex={selectedIndex - pinnedItems.length}

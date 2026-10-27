@@ -71,6 +71,8 @@ export const useKeyboardNavigation = ({
 
     const handleKeyDown = async (e: KeyboardEvent) => {
       if (!isWindowVisibleRef.current) return;
+      // Candidate selection belongs to the IME, including its final 229 key event.
+      if (e.isComposing || e.keyCode === 229) return;
       if (isPastingLocal) {
         e.preventDefault();
         e.stopPropagation();

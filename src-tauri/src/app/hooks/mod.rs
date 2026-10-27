@@ -324,7 +324,11 @@ pub unsafe extern "system" fn keyboard_proc(
 
         // 5. Global Navigation Keys (Up/Down, Enter, Esc)
         if NAVIGATION_ENABLED.load(Ordering::SeqCst) && !IS_RECORDING.load(Ordering::SeqCst) {
-            if IS_HIDDEN.load(Ordering::Relaxed) {
+            // Once the WebView has focus it handles navigation and IME itself.
+            // Intercepting here steals candidate Enter/Escape before JS can guard it.
+            if IS_HIDDEN.load(Ordering::Relaxed)
+                || IS_MAIN_WINDOW_FOCUSED.load(Ordering::Relaxed)
+            {
                 return CallNextHookEx(None, n_code, w_param, l_param);
             }
             let allow_navigation = if let Some(handle) = GLOBAL_APP_HANDLE.get() {
@@ -373,7 +377,9 @@ pub unsafe extern "system" fn keyboard_proc(
                                 let handle_clone = handle.clone();
                                 tauri::async_runtime::spawn(async move {
                                     let _ = handle_clone.emit("navigation-action", "escape");
-                                    toggle_window(&handle_clone);
+                                    // Esc is a hide action, not a toggle: repeated key
+                                    // events queued before hiding must never reopen it.
+                                    let _ = hide_window_cmd(handle_clone);
                                 });
                             } else {
                                 let _ = handle.emit("navigation-action", action);

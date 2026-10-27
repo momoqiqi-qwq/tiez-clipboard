@@ -38,8 +38,22 @@ fn main() {
                 })
                 .build(),
         )
-        .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                // Restoring maximize/fullscreen can show an empty native frame too.
+                // Only geometry survives; visibility belongs to React readiness.
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION,
+                )
+                .build(),
+        )
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Launching TieZ again (desktop shortcut, taskbar, autostart) must surface
+            // the already-running window. An empty callback made the second launch
+            // exit silently, so the app looked like it never opened.
+            app::window_manager::reveal_main_window(app);
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -50,6 +64,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app::window_manager::main_window_ready,
             app::window_manager::toggle_window_cmd,
             app::window_manager::hide_window_cmd,
             app::window_manager::activate_window_focus,
@@ -58,6 +73,7 @@ fn main() {
             app::window_manager::set_navigation_mode,
             app::hooks::set_recording_mode,
             services::content_handler::open_content,
+            services::drag_out::start_drag_out,
             services::clipboard_ops::copy_to_clipboard,
             services::clipboard_ops::paste_latest_rich,
             app::commands::get_clipboard_history,
@@ -169,6 +185,7 @@ fn main() {
         .on_window_event(|window, event| {
             setup::handle_window_event(window, event);
         })
+        .on_page_load(app::window_manager::handle_main_page_load)
         .build(tauri::generate_context!());
 
     match app {

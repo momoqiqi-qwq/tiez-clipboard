@@ -102,7 +102,7 @@ pub fn set_paste_last_hotkey(
     crate::app::commands::hotkey_cmd::sync_registered_hotkeys(&app_handle)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_deduplication(
     app_handle: AppHandle,
     state: State<'_, crate::app_state::SettingsState>,
@@ -115,7 +115,7 @@ pub fn set_deduplication(
         .set("app.deduplicate", &enabled.to_string());
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_setting(
     db_state: State<'_, DbState>,
     settings_state: State<'_, crate::app_state::SettingsState>,
@@ -242,14 +242,14 @@ pub fn set_window_pinned(app_handle: AppHandle, state: State<'_, DbState>, pinne
         .set("app.window_pinned", &pinned.to_string());
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_settings(
     state: State<'_, DbState>,
 ) -> AppResult<std::collections::HashMap<String, String>> {
     state.settings_repo.get_all().map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_file_server_auto_close(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -264,7 +264,7 @@ pub fn set_file_server_auto_close(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_file_transfer_auto_open(db_state: State<'_, DbState>, enabled: bool) -> AppResult<()> {
     db_state
         .settings_repo
@@ -272,7 +272,7 @@ pub fn set_file_transfer_auto_open(db_state: State<'_, DbState>, enabled: bool) 
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_arrow_key_selection(
     state: State<'_, crate::app_state::SettingsState>,
     enabled: bool,
@@ -281,7 +281,7 @@ pub fn set_arrow_key_selection(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_persistence(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -294,7 +294,7 @@ pub fn set_persistence(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_capture_files(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -307,7 +307,7 @@ pub fn set_capture_files(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_capture_rich_text(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -320,7 +320,7 @@ pub fn set_capture_rich_text(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_auto_copy_file(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -336,7 +336,7 @@ pub fn set_auto_copy_file(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_silent_start(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -349,7 +349,7 @@ pub fn set_silent_start(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_delete_after_paste(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -362,7 +362,7 @@ pub fn set_delete_after_paste(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_privacy_protection(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -375,7 +375,7 @@ pub fn set_privacy_protection(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_privacy_protection_kinds(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -390,7 +390,7 @@ pub fn set_privacy_protection_kinds(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_privacy_protection_custom_rules(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -409,7 +409,7 @@ pub fn set_privacy_protection_custom_rules(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_cleanup_rules(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -423,7 +423,7 @@ pub fn set_cleanup_rules(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_app_cleanup_policies(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,
@@ -437,7 +437,7 @@ pub fn set_app_cleanup_policies(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_sound_enabled(
     state: State<'_, crate::app_state::SettingsState>,
     db_state: State<'_, DbState>,

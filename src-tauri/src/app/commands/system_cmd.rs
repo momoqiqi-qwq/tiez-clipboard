@@ -55,43 +55,69 @@ pub fn open_file_location(file_path: String) -> AppResult<()> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn toggle_autostart(enabled: bool) -> AppResult<()> {
-    use winreg::enums::*;
-    use winreg::RegKey;
+/// 开机自启动所在的注册表键（HKCU）。
+const AUTOSTART_RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/// TieZ 在这个键里用过的值名：历史版本各写过一个，读写和清理都要覆盖，
+/// 否则旧值名残留一条指向同一个 exe 的项，界面上的开关就会"关不掉"。
+const AUTOSTART_VALUE_NAMES: [&str; 3] = ["TieZ", "tie-z", "tiez-app"];
 
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu
-        .open_subkey_with_flags(
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            KEY_WRITE | KEY_READ,
-        )
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+/// 开机自启动要写入的命令行。
+///
+/// 带 `--minimized` 让开机那一次静默进托盘（setup 按参数决定是否隐藏窗口），
+/// 与 tauri-plugin-autostart 初始化时的参数保持一致。
+fn autostart_command_line() -> AppResult<String> {
     let app_path = std::env::current_exe()
         .map_err(|e| AppError::Internal(e.to_string()))?
         .to_string_lossy()
         .to_string();
-    let cmd = format!("\"{}\" --minimized", app_path);
+    Ok(format!("\"{}\" --minimized", app_path))
+}
+
+/// 真正的注册表写入/清理。启动时的默认策略和设置页开关都走这里。
+pub fn apply_autostart(enabled: bool) -> AppResult<()> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = match hkcu.open_subkey_with_flags(AUTOSTART_RUN_KEY, KEY_WRITE | KEY_READ) {
+        Ok(key) => key,
+        Err(_) => hkcu
+            .create_subkey(AUTOSTART_RUN_KEY)
+            .map(|(key, _)| key)
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+    };
+
+    // 先清掉所有历史值名，避免同一程序出现多条自启动项被重复拉起。
+    for name in AUTOSTART_VALUE_NAMES {
+        let _ = key.delete_value(name);
+    }
 
     if enabled {
-        key.set_value("TieZ", &cmd)
+        key.set_value(AUTOSTART_VALUE_NAMES[0], &autostart_command_line()?)
             .map_err(|e| AppError::Internal(e.to_string()))?;
-    } else {
-        let _ = key.delete_value("TieZ");
-        let _ = key.delete_value("tie-z");
     }
     Ok(())
 }
 
-#[tauri::command]
-pub fn is_autostart_enabled() -> AppResult<bool> {
+/// 读取注册表里当前记录的自启动命令行；未启用（或读不到键）时为 None。
+pub fn current_autostart_command() -> Option<String> {
     use winreg::enums::*;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu
-        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(key.get_value::<String, _>("TieZ").is_ok() || key.get_value::<String, _>("tie-z").is_ok())
+    let key = hkcu.open_subkey(AUTOSTART_RUN_KEY).ok()?;
+    AUTOSTART_VALUE_NAMES
+        .iter()
+        .find_map(|name| key.get_value::<String, _>(name).ok())
+}
+
+#[tauri::command]
+pub fn toggle_autostart(enabled: bool) -> AppResult<()> {
+    apply_autostart(enabled)
+}
+
+#[tauri::command]
+pub fn is_autostart_enabled() -> AppResult<bool> {
+    Ok(current_autostart_command().is_some())
 }
 
 #[tauri::command]

@@ -20,7 +20,7 @@ fn normalize_rich_text_item_content(item: &mut ClipboardEntry) {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_clipboard_history(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
@@ -102,39 +102,43 @@ pub fn get_clipboard_history(
     Ok(history)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn search_clipboard_history(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
     search_term: String,
     limit: i32,
     tag_only: Option<bool>,
+    offset: Option<usize>,
+    content_type: Option<String>,
 ) -> AppResult<Vec<ClipboardEntry>> {
     let is_tag_only = tag_only.unwrap_or(false);
-    let mut history = state.repo.search(&search_term, limit, is_tag_only)?;
-
-    let term = search_term.to_lowercase();
-    let session_items = session.inner().0.lock().unwrap();
-    for item in session_items.iter().rev() {
-        let matches = if is_tag_only {
-            item.tags.iter().any(|t| t.to_lowercase().contains(&term))
-        } else {
-            item.content.to_lowercase().contains(&term)
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let session_items = session.inner().0.lock()
+        .map_err(|e| AppError::from(e.to_string()))?
+        .iter().cloned().collect::<Vec<_>>();
+    let mut history = if is_tag_only {
+        state.repo.search_tag_page(
+            &search_term, limit as usize, offset.unwrap_or(0),
+            content_type.as_deref(), &session_items,
+        )?
+    } else {
+        let mut results = state.repo.search(&search_term, limit, false)?;
+        let term = search_term.trim().to_lowercase();
+        for item in session_items.iter().rev() {
+            let matches = item.content.to_lowercase().contains(&term)
                 || item.source_app.to_lowercase().contains(&term)
-                || item.tags.iter().any(|t| t.to_lowercase().contains(&term))
-        };
-
-        if matches {
-            if !history.iter().any(|h| h.id == item.id && item.id != 0) {
-                history.push(item.clone());
+                || item.tags.iter().any(|t| t.to_lowercase().contains(&term));
+            if matches && !results.iter().any(|h| h.id == item.id && item.id != 0) {
+                results.push(item.clone());
             }
         }
-    }
-
-    history.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
-    if history.len() > limit as usize {
-        history.truncate(limit as usize);
-    }
+        results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| b.id.cmp(&a.id)));
+        results.truncate(limit as usize);
+        results
+    };
 
     for item in &mut history {
         normalize_rich_text_item_content(item);
@@ -173,7 +177,7 @@ pub fn search_clipboard_history(
     Ok(history)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_clipboard_entry(
     app_handle: AppHandle,
     state: State<'_, DbState>,
@@ -195,7 +199,7 @@ pub fn delete_clipboard_entry(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clear_clipboard_history(
     app_handle: AppHandle,
     state: State<'_, DbState>,
@@ -213,7 +217,7 @@ pub fn clear_clipboard_history(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_tag_items(state: State<'_, DbState>, tag: String) -> AppResult<Vec<ClipboardEntry>> {
     let mut history = state
         .tag_repo
@@ -251,14 +255,14 @@ pub fn get_tag_items(state: State<'_, DbState>, tag: String) -> AppResult<Vec<Cl
     Ok(history)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_all_tags_info(
     state: State<'_, DbState>,
 ) -> AppResult<std::collections::HashMap<String, i32>> {
     state.tag_repo.get_all_with_counts().map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_tag_globally(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
@@ -287,7 +291,7 @@ pub fn rename_tag_globally(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_tag_from_all(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
@@ -309,12 +313,12 @@ pub fn delete_tag_from_all(
         .map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_new_tag(state: State<'_, DbState>, tag_name: String) -> AppResult<()> {
     state.tag_repo.create(&tag_name).map_err(AppError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_clipboard_content(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
@@ -351,7 +355,7 @@ pub fn get_clipboard_content(
     Err(AppError::Validation("Entry not found".to_string()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_pinned_order(
     app_handle: AppHandle,
     state: State<'_, DbState>,
@@ -366,7 +370,7 @@ pub fn update_pinned_order(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_db_count(state: State<'_, DbState>) -> AppResult<i64> {
     state.repo.get_count().map_err(AppError::from)
 }

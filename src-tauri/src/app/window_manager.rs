@@ -1,4 +1,5 @@
 use crate::app_state::SettingsState;
+use crate::app::window_lifecycle::MAIN_WINDOW_LIFECYCLE;
 use crate::global_state::*;
 #[cfg(target_os = "windows")]
 use crate::infrastructure::windows_ext::WindowExt;
@@ -71,7 +72,49 @@ fn remap_fixed_window_position(
     )
 }
 
+pub fn mark_window_shown() {
+    MAIN_WINDOW_LIFECYCLE.invalidate_blur();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    LAST_SHOW_TIMESTAMP.store(now, Ordering::Relaxed);
+}
+
+#[tauri::command]
+pub fn main_window_ready(window: tauri::WebviewWindow) {
+    if window.label() == "main" && MAIN_WINDOW_LIFECYCLE.mark_ready() {
+        reveal_main_window(window.app_handle());
+    }
+}
+
+pub fn handle_main_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
+    if webview.label() != "main" || payload.event() != tauri::webview::PageLoadEvent::Started {
+        return;
+    }
+    let window = webview.window();
+    let was_visible = window.is_visible().unwrap_or(false);
+    let generation = MAIN_WINDOW_LIFECYCLE.mark_loading(was_visible);
+    let _ = window.hide();
+    let app = webview.app_handle().clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(show) = MAIN_WINDOW_LIFECYCLE.finish_loading_timeout(generation) {
+                crate::error!("[UI] Main page readiness timed out; allowing recovery shell.");
+                if show {
+                    reveal_main_window(&handle);
+                }
+            }
+        });
+    });
+}
+
 pub fn toggle_window(app: &AppHandle) {
+    if !MAIN_WINDOW_LIFECYCLE.request_show() {
+        return;
+    }
     if let Some(window) = app.get_webview_window("main") {
         #[cfg(windows)]
         let mut active_center: Option<(i32, i32)> = None;
@@ -79,6 +122,7 @@ pub fn toggle_window(app: &AppHandle) {
         let is_hidden_by_edge = IS_HIDDEN.load(Ordering::Relaxed);
 
         if is_visible && !is_hidden_by_edge {
+            MAIN_WINDOW_LIFECYCLE.request_hide();
             #[cfg(target_os = "windows")]
             WindowExt::release_win_keys();
             let _ = window.set_focusable(false);
@@ -92,6 +136,8 @@ pub fn toggle_window(app: &AppHandle) {
             return;
         }
 
+        mark_window_shown();
+        let _ = window.unminimize();
         IS_HIDDEN.store(false, Ordering::Relaxed);
         NAVIGATION_ENABLED.store(true, Ordering::SeqCst);
         let was_docked = is_hidden_by_edge;
@@ -163,22 +209,28 @@ pub fn toggle_window(app: &AppHandle) {
                         let my = m_pos.y;
                         let mw = m_size.width as i32;
                         let mh = m_size.height as i32;
+                        // Keep this margin clearly wider than the edge-docking trigger
+                        // (5px). Placing the panel flush against a screen edge made the
+                        // docking monitor treat the freshly summoned window as docked and
+                        // slide it straight off screen, so the hotkey looked like it did
+                        // nothing (or flashed a 3px sliver).
+                        const EDGE_MARGIN: i32 = 16;
                         if target_x < mx {
-                            target_x = mx + 5;
+                            target_x = mx + EDGE_MARGIN;
                         }
                         if target_x + w > mx + mw {
-                            target_x = mx + mw - w - 5;
+                            target_x = mx + mw - w - EDGE_MARGIN;
                         }
                         if target_y + h > my + mh {
                             let above_y = point.y - h - 12;
                             if above_y >= my {
                                 target_y = above_y;
                             } else {
-                                target_y = my + mh - h - 5;
+                                target_y = my + mh - h - EDGE_MARGIN;
                             }
                         }
                         if target_y < my {
-                            target_y = my + 5;
+                            target_y = my + EDGE_MARGIN;
                         }
                     }
 
@@ -337,11 +389,7 @@ pub fn toggle_window(app: &AppHandle) {
 
         #[cfg(target_os = "windows")]
         WindowExt::release_win_keys();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        LAST_SHOW_TIMESTAMP.store(now, Ordering::Relaxed);
+        mark_window_shown();
 
         let pinned = WINDOW_PINNED.load(Ordering::Relaxed);
         let _ = window.set_always_on_top(pinned);
@@ -374,6 +422,51 @@ pub fn toggle_window(app: &AppHandle) {
         {
             let _ = window.show();
         }
+    }
+}
+
+/// Bring the main window up for an explicit user action (second launch of the app,
+/// tray activation).
+///
+/// A hidden or edge-docked window goes through `toggle_window` so it is repositioned
+/// onto the cursor monitor; a window that is already on screen is only raised - hiding
+/// it here would look like the launch did nothing.
+pub fn reveal_main_window(app: &AppHandle) {
+    if !MAIN_WINDOW_LIFECYCLE.request_show() {
+        return;
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    let is_visible = window.is_visible().unwrap_or(false);
+    let is_hidden_by_edge = IS_HIDDEN.load(Ordering::Relaxed);
+
+    if !is_visible || is_hidden_by_edge {
+        toggle_window(app);
+        return;
+    }
+
+    mark_window_shown();
+    let _ = window.unminimize();
+    let pinned = WINDOW_PINNED.load(Ordering::Relaxed);
+    let _ = window.set_always_on_top(pinned);
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(hwnd_raw) = window.hwnd() {
+            if pinned {
+                WindowExt::show_window_no_activate(HWND(hwnd_raw.0));
+            } else {
+                WindowExt::show_window_no_activate_normal(HWND(hwnd_raw.0));
+                let _ = window.set_focus();
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window.set_focus();
     }
 }
 
@@ -417,6 +510,7 @@ pub fn activate_window_focus(app_handle: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn hide_window_cmd(app_handle: AppHandle) -> Result<(), String> {
+    MAIN_WINDOW_LIFECYCLE.request_hide();
     if let Some(window) = app_handle.get_webview_window("main") {
         #[cfg(target_os = "windows")]
         WindowExt::release_win_keys();
@@ -437,7 +531,15 @@ pub fn toggle_window_cmd(app_handle: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn focus_clipboard_window(app_handle: AppHandle) -> Result<(), String> {
+    if !MAIN_WINDOW_LIFECYCLE.request_show() {
+        return Ok(());
+    }
     if let Some(window) = app_handle.get_webview_window("main") {
+        mark_window_shown();
+        if IS_HIDDEN.load(Ordering::Relaxed) || !window.is_visible().unwrap_or(false) {
+            toggle_window(&app_handle);
+        }
+        let _ = window.unminimize();
         let _ = window.set_focusable(true);
         let _ = window.show();
 
@@ -489,7 +591,7 @@ mod tests {
     use super::{remap_fixed_window_position, MonitorBounds};
 
     #[test]
-    fn keeps_bottom_right_anchor_when_switching_monitors() {
+    fn preserves_relative_position_near_bottom_right_when_switching_monitors() {
         let source = MonitorBounds {
             x: 0,
             y: 0,
@@ -505,7 +607,8 @@ mod tests {
 
         let mapped = remap_fixed_window_position((1610, 670), (300, 400), source, target);
 
-        assert_eq!(mapped, (4180, 1040));
+        // The original 10px gaps scale with the available travel on each axis.
+        assert_eq!(mapped, (4166, 1025));
     }
 
     #[test]
@@ -525,7 +628,9 @@ mod tests {
 
         let mapped = remap_fixed_window_position((810, 340), (300, 400), source, target);
 
-        assert_eq!(mapped, (-800, 250));
+        // Positions are top-left coordinates: target center (-800, 450)
+        // minus half the window size (150, 200).
+        assert_eq!(mapped, (-950, 250));
     }
 
     #[test]

@@ -457,25 +457,38 @@ pub async fn call_ai(
                 .map_err(|e| format!("Database update failed: {}", e))?;
         }
 
-        // Sync Session History and Emit Update
+        // Sync Session History and Emit Update.
+        //
+        // The session lock is released before the DB connection is taken. The
+        // clipboard pipeline holds the connection and then takes the session, so
+        // acquiring them in the opposite order here deadlocked both threads (the
+        // UI then blocked forever on the first database command).
         use crate::app_state::SessionHistory;
-        if let Some(session) = app_handle.try_state::<SessionHistory>() {
-            let mut history = session.0.lock().unwrap();
-            if let Some(item) = history.iter_mut().find(|i| i.id == id) {
-                item.content = ai_response.clone();
-                item.preview = preview.clone();
-                // Clear rich text so AI result is shown
-                if item.content_type == "rich_text" {
-                    item.content_type = "text".to_string();
-                    item.html_content = None;
+        let session_item = {
+            let mut updated = None;
+            if let Some(session) = app_handle.try_state::<SessionHistory>() {
+                let mut history = session.0.lock().unwrap();
+                if let Some(item) = history.iter_mut().find(|i| i.id == id) {
+                    item.content = ai_response.clone();
+                    item.preview = preview.clone();
+                    // Clear rich text so AI result is shown
+                    if item.content_type == "rich_text" {
+                        item.content_type = "text".to_string();
+                        item.html_content = None;
+                    }
+                    updated = Some(item.clone());
                 }
-                // Emit update event from session item
-                let _ = app_handle.emit("clipboard-updated", item.clone());
-            } else if persistent {
-                // If persistent and not in session, fetch from DB to emit
-                if let Ok(Some(updated_entry)) = state.repo.get_entry_by_id(id) {
-                    let _ = app_handle.emit("clipboard-updated", updated_entry);
-                }
+            }
+            updated
+        };
+
+        if let Some(item) = session_item {
+            // Emit update event from session item
+            let _ = app_handle.emit("clipboard-updated", item);
+        } else if persistent {
+            // If persistent and not in session, fetch from DB to emit
+            if let Ok(Some(updated_entry)) = state.repo.get_entry_by_id(id) {
+                let _ = app_handle.emit("clipboard-updated", updated_entry);
             }
         }
 

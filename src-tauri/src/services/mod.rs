@@ -5,6 +5,7 @@ pub mod clipboard_listener;
 pub mod clipboard_ops;
 pub mod cloud_sync;
 pub mod content_handler;
+pub mod drag_out;
 pub mod encryption_queue;
 pub mod file_transfer;
 pub mod mqtt_sub;

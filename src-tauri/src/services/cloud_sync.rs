@@ -431,6 +431,10 @@ fn get_config(app: &AppHandle) -> Option<CloudSyncConfig> {
     if did_migrate_device_id {
         if let Ok(conn) = db_state.conn.lock() {
             let _ = conn.execute("DELETE FROM cloud_sync_local_index", []);
+            // The index is gone, so every cached tombstone digest has to be re-offered as well.
+            // Leaving `indexed_digest` set would mark those tombstones as settled and the remote
+            // would never learn about the deletions again.
+            let _ = conn.execute("UPDATE cloud_sync_tombstones SET indexed_digest = NULL", []);
         }
     }
 
@@ -779,9 +783,119 @@ fn normalize_item_for_sync(mut item: CloudSyncItem) -> Option<CloudSyncItem> {
     Some(item)
 }
 
+/// Rewrites items into their upload form (image paths -> data URLs, rich_text html local
+/// resources inlined). The per-sync scan keeps raw content and only calls this for the
+/// items it is about to upload; images whose file vanished are dropped here, which is the
+/// same outcome as when the scan normalized eagerly.
+fn normalize_items_for_upload(items: &[CloudSyncItem]) -> Vec<CloudSyncItem> {
+    items
+        .iter()
+        .filter_map(|item| normalize_item_for_sync(item.clone()))
+        .collect()
+}
+
+const SYNC_IMAGE_HASH_CACHE_MAX: usize = 2048;
+const SYNC_HTML_DIGEST_CACHE_MAX: usize = 1024;
+
+/// path -> (mtime_ms, len, visual hash)
+static SYNC_IMAGE_HASH_CACHE: OnceLock<Mutex<HashMap<String, (u64, u64, i64)>>> = OnceLock::new();
+/// raw-html hash -> rewritten-html hash
+static SYNC_HTML_DIGEST_CACHE: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+
+fn sync_image_hash_cache_lock() -> std::sync::MutexGuard<'static, HashMap<String, (u64, u64, i64)>> {
+    SYNC_IMAGE_HASH_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn sync_html_digest_cache_lock() -> std::sync::MutexGuard<'static, HashMap<u64, u64>> {
+    SYNC_HTML_DIGEST_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Visual hash of an image, memoized per source path.
+///
+/// `database::calc_image_hash` reads and fully decodes the image (a 32x32 resize is done
+/// afterwards) just to produce a fingerprint. A sync round runs for every clipboard change
+/// and used to re-read + re-decode the whole image set (tens of MB here) each time, which
+/// dominated the per-copy CPU cost. The result only depends on the file bytes, so it is
+/// memoized by path and validated against (mtime, size) so that replacing a file
+/// invalidates the entry.
+///
+/// Data URLs (not used by the clipboard rows here, which store a path) are not memoized.
+fn cached_image_hash(content: &str) -> Option<i64> {
+    let trimmed = content.trim();
+    let path_like =
+        !trimmed.starts_with("data:") && (trimmed.starts_with('/') || trimmed.contains(":\\"));
+    if !path_like {
+        return crate::database::calc_image_hash(trimmed);
+    }
+
+    let meta = std::fs::metadata(trimmed).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let len = meta.len();
+
+    if let Some((cached_mtime, cached_len, hash)) =
+        sync_image_hash_cache_lock().get(trimmed).copied()
+    {
+        if cached_mtime == mtime_ms && cached_len == len {
+            return Some(hash);
+        }
+    }
+
+    let hash = crate::database::calc_image_hash(trimmed)?;
+    let mut cache = sync_image_hash_cache_lock();
+    if cache.len() >= SYNC_IMAGE_HASH_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(trimmed.to_string(), (mtime_ms, len, hash));
+    Some(hash)
+}
+
+/// Hash of the html payload as it will be uploaded (local resource paths already inlined),
+/// memoized by the raw html.
+///
+/// Sync digests must keep describing the uploaded form, but re-writing every rich_text
+/// payload on every round is wasted work for content that almost never changes. The memo
+/// maps raw-html hash -> rewritten-html hash so digests stay byte-identical to the values
+/// computed before (no spurious re-upload of the existing cloud state) while repeat rounds
+/// only pay one SipHash pass. Keyed by a 64-bit hash: a collision could at worst leave one
+/// item's digest stale, it can never change what is uploaded.
+///
+/// Known limitation: the value is keyed by the raw html alone, so if a local file the html
+/// references (an `<img src="...">` absolute path, or the fallback payload) is edited in
+/// place while the html text stays byte-identical, the cached digest keeps describing the
+/// old bytes and the item is not re-pushed until something else about it changes
+/// (timestamp / use_count / tags / preview). Uploads themselves are never stale:
+/// `normalize_items_for_upload` re-reads the files on every upload. Validating this memo
+/// against referenced-file mtimes would require the rewrite to report the paths it inlined;
+/// not done here.
+fn rewritten_html_hash(html: &str) -> u64 {
+    let key = crate::database::calc_text_hash(html);
+    if let Some(cached) = sync_html_digest_cache_lock().get(&key).copied() {
+        return cached;
+    }
+    let rewritten = rewrite_rich_html_resources_for_sync(html);
+    let value = crate::database::calc_text_hash(&rewritten);
+    let mut cache = sync_html_digest_cache_lock();
+    if cache.len() >= SYNC_HTML_DIGEST_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(key, value);
+    value
+}
+
 fn compute_sync_content_hash(content_type: &str, content: &str) -> i64 {
     match content_type {
-        "image" => crate::database::calc_image_hash(content).unwrap_or(0),
+        "image" => cached_image_hash(content).unwrap_or(0),
         "text" | "code" | "url" | "rich_text" | "file" | "video" => {
             crate::database::calc_text_hash(content) as i64
         }
@@ -807,10 +921,12 @@ fn sync_key_for_item(item: &CloudSyncItem) -> Option<String> {
 
 fn sync_digest_for_item(item: &CloudSyncItem) -> String {
     let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".to_string());
+    // `html_content` is the raw payload here (normalization is deferred to upload), so the
+    // hash is taken over the upload form via the memoized rewrite.
     let html_hash = item
         .html_content
         .as_ref()
-        .map(|v| crate::database::calc_text_hash(v))
+        .map(|v| rewritten_html_hash(v))
         .unwrap_or(0);
     let preview_hash = crate::database::calc_text_hash(&item.preview);
     let source_hash = crate::database::calc_text_hash(&item.source_app);
@@ -942,26 +1058,41 @@ async fn enrich_item_blobs_after_pull(
     Ok(())
 }
 
-fn collapse_items_by_sync_key(items: &[CloudSyncItem]) -> BTreeMap<String, CloudSyncItem> {
-    let mut map: BTreeMap<String, CloudSyncItem> = BTreeMap::new();
+/// Collapse the local view to one item per sync key (newest timestamp wins).
+///
+/// Returns borrows: the digest only reads fields, and cloning every item on every sync round
+/// (16k+ items, rich_text html payloads included) cost ~15ms of pure memcpy per round.
+/// `resolved_content_hash` is deliberately not written back here - every caller already
+/// stores the resolved hash on the items it passes in (history rows get it from
+/// `compute_sync_content_hash`, tombstones carry it from the DB), and items whose hash cannot
+/// be resolved are dropped by `sync_key_for_item` anyway. The few items that actually need to
+/// be uploaded get their hash re-resolved when they are cloned in
+/// `collect_local_incremental_items`.
+fn collapse_items_by_sync_key(items: &[CloudSyncItem]) -> BTreeMap<String, &CloudSyncItem> {
+    let mut map: BTreeMap<String, &CloudSyncItem> = BTreeMap::new();
     for item in items {
         let Some(key) = sync_key_for_item(item) else {
             continue;
         };
-        let mut normalized = item.clone();
-        normalized.content_hash = resolved_content_hash(item);
 
         let replace = map
             .get(&key)
-            .map(|old| normalized.timestamp >= old.timestamp)
+            .map(|old| item.timestamp >= old.timestamp)
             .unwrap_or(true);
         if replace {
-            map.insert(key, normalized);
+            map.insert(key, item);
         }
     }
     map
 }
 
+/// Load the stored sync index.
+///
+/// The table holds live keys only: a tombstone carries its own push state on its row (`digest` /
+/// `indexed_digest`), migration 14 removed the rows that settled tombstones shadowed and nothing
+/// writes an index row for a tombstone again (`collect_local_incremental_items`). That is why this
+/// is a plain read - the anti-join that used to skip the ~14k shadowed rows cost ~15ms per round on
+/// a store shaped like the live one, i.e. more than the ~7ms full read it filtered.
 fn load_local_sync_index(app: &AppHandle) -> AppResult<HashMap<String, String>> {
     let db_state = app
         .try_state::<DbState>()
@@ -988,10 +1119,35 @@ fn load_local_sync_index(app: &AppHandle) -> AppResult<HashMap<String, String>> 
     Ok(index)
 }
 
-fn replace_local_sync_index(
-    app: &AppHandle,
-    collapsed: &BTreeMap<String, CloudSyncItem>,
-) -> AppResult<()> {
+/// The minimal set of index writes that brings the stored sync index in line with the local
+/// view. Only keys whose digest actually changed (or disappeared) are touched.
+struct LocalIndexUpdate {
+    upserts: Vec<(String, String)>,
+    /// Keys the stored index must forget: live items that disappeared, plus any leftover row of a
+    /// tombstone key (a tombstone's push state lives on its own row, never in the index).
+    removals: Vec<String>,
+    /// Pending tombstones whose digest is already in the index: caching it on the row settles
+    /// them for the next round without any upload.
+    settled_tombstones: Vec<(String, String)>,
+    /// Pending tombstones that are part of the delta. Their digest is cached in the same
+    /// transaction as the index write, so a failed upload cannot settle them.
+    pushed_tombstones: Vec<(String, String)>,
+}
+
+/// Apply `update` to `cloud_sync_local_index` and cache the digests of tombstones that are part
+/// of the delta.
+///
+/// This used to be `DELETE FROM cloud_sync_local_index` followed by re-INSERTing every key
+/// (~16k rows, ~35ms measured on a copy of the real DB) on every round that had a delta -
+/// including rounds where a single row had changed.
+fn replace_local_sync_index(app: &AppHandle, update: &LocalIndexUpdate) -> AppResult<()> {
+    if update.upserts.is_empty()
+        && update.removals.is_empty()
+        && update.settled_tombstones.is_empty()
+    {
+        return Ok(());
+    }
+
     let db_state = app
         .try_state::<DbState>()
         .ok_or_else(|| AppError::Internal("DB state unavailable".to_string()))?;
@@ -1002,41 +1158,139 @@ fn replace_local_sync_index(
     let tx = conn
         .transaction()
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    tx.execute("DELETE FROM cloud_sync_local_index", [])
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    for (sync_key, item) in collapsed {
-        let digest = sync_digest_for_item(item);
+    for (sync_key, digest) in &update.upserts {
         tx.execute(
-            "INSERT INTO cloud_sync_local_index (sync_key, digest) VALUES (?1, ?2)",
+            "INSERT INTO cloud_sync_local_index (sync_key, digest) VALUES (?1, ?2)
+             ON CONFLICT(sync_key) DO UPDATE SET digest = excluded.digest",
             rusqlite::params![sync_key, digest],
         )
         .map_err(|e| AppError::Internal(e.to_string()))?;
     }
+    for sync_key in &update.removals {
+        tx.execute(
+            "DELETE FROM cloud_sync_local_index WHERE sync_key = ?1",
+            rusqlite::params![sync_key],
+        )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+    cache_tombstone_digests(&tx, &update.pushed_tombstones)?;
     tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(())
 }
 
+/// Store `digest` and `indexed_digest` for `rows` (`sync_key`, digest), marking the tombstone as
+/// settled: the digest is a pure function of the row's immutable fields, and `indexed_digest` is
+/// stamped with the same value once that deletion is known to have been pushed (it used to mirror
+/// the key's row in `cloud_sync_local_index`, which migration 14 no longer keeps for tombstones).
+fn cache_tombstone_digests(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[(String, String)],
+) -> AppResult<()> {
+    for (sync_key, digest) in rows {
+        tx.execute(
+            "UPDATE cloud_sync_tombstones SET digest = ?2, indexed_digest = ?2 WHERE sync_key = ?1",
+            rusqlite::params![sync_key, digest],
+        )
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Cache the digests of tombstones whose deletion the stored index already records.
+///
+/// These rows produce no delta, so this is the only place their digest gets written; without it
+/// every round would re-hash the entire tombstone table.
+fn store_settled_tombstone_digests(app: &AppHandle, rows: &[(String, String)]) -> AppResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let db_state = app
+        .try_state::<DbState>()
+        .ok_or_else(|| AppError::Internal("DB state unavailable".to_string()))?;
+    let mut conn = db_state
+        .conn
+        .lock()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    cache_tombstone_digests(&tx, rows)?;
+    tx.commit().map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+/// Diff the local view against the stored index.
+///
+/// Returns the items to upload plus the index writes that make the stored index match. Both
+/// decisions come from a single digest pass - recomputing every digest a second time inside
+/// `replace_local_sync_index` was ~18ms per delta round on a store shaped like this one.
+///
+/// Tombstones are handled separately from live items: their push state lives on the tombstone row
+/// (`digest` / `indexed_digest`), so they never get an index row. A tombstone that `prev_index`
+/// already records with the same digest was pushed by an older build, so it settles without an
+/// upload (that is the whole point of the digest cache); every other pending tombstone goes into the
+/// delta. Any leftover index row for such a key is dropped in the same transaction, which is what
+/// migrates a store that still indexes tombstones onto the row-owned state.
 fn collect_local_incremental_items(
     app: &AppHandle,
-    local_items: &[CloudSyncItem],
-) -> AppResult<(Vec<CloudSyncItem>, BTreeMap<String, CloudSyncItem>)> {
-    let collapsed = collapse_items_by_sync_key(local_items);
+    view: &LocalDeltaView,
+) -> AppResult<(Vec<CloudSyncItem>, LocalIndexUpdate)> {
+    let collapsed = collapse_items_by_sync_key(&view.items);
     let prev_index = load_local_sync_index(app)?;
 
     let mut deltas = Vec::new();
+    let mut upserts = Vec::new();
+    let mut removals = Vec::new();
+    let mut settled_tombstones = Vec::new();
+    let mut pushed_tombstones = Vec::new();
     for (sync_key, item) in &collapsed {
-        let digest = sync_digest_for_item(item);
-        let changed = prev_index
-            .get(sync_key)
-            .map(|old| old != &digest)
-            .unwrap_or(true);
-        if changed {
-            deltas.push(item.clone());
+        let pending = view.pending_tombstones.contains(sync_key);
+        // Pending tombstones normally carry their digest already; re-hashing one is the
+        // exception (first round after the row was written, or after the cache migration).
+        let digest = match view.tombstone_digests.get(sync_key) {
+            Some(stored) => stored.clone(),
+            None => sync_digest_for_item(item),
+        };
+        if pending {
+            if prev_index.get(sync_key).map(|old| old == &digest) == Some(true) {
+                settled_tombstones.push((sync_key.clone(), digest));
+            } else {
+                let mut delta = (*item).clone();
+                delta.content_hash = resolved_content_hash(item);
+                deltas.push(delta);
+                pushed_tombstones.push((sync_key.clone(), digest));
+            }
+            if prev_index.contains_key(sync_key) {
+                removals.push(sync_key.clone());
+            }
+            continue;
         }
+        if prev_index.get(sync_key).map(|old| old == &digest) == Some(true) {
+            continue;
+        }
+        let mut delta = (*item).clone();
+        delta.content_hash = resolved_content_hash(item);
+        deltas.push(delta);
+        upserts.push((sync_key.clone(), digest.clone()));
     }
 
+    removals.extend(
+        prev_index
+            .keys()
+            .filter(|key| !collapsed.contains_key(*key))
+            .cloned(),
+    );
+
     deltas.sort_by_key(|item| item.timestamp);
-    Ok((deltas, collapsed))
+    Ok((
+        deltas,
+        LocalIndexUpdate {
+            upserts,
+            removals,
+            settled_tombstones,
+            pushed_tombstones,
+        },
+    ))
 }
 
 fn get_setting_i64(app: &AppHandle, key: &str, default: i64) -> i64 {
@@ -1120,7 +1374,8 @@ fn get_app_data_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
     Some(guard.clone())
 }
 
-fn collect_local_syncable_items(
+/// Local clipboard rows in their raw (un-normalized) form.
+fn collect_local_history_items(
     app: &AppHandle,
     prefs: &CloudSyncContentPrefs,
 ) -> AppResult<Vec<CloudSyncItem>> {
@@ -1152,13 +1407,22 @@ fn collect_local_syncable_items(
         }
     }
 
+    // Intentionally NOT normalized here: `normalize_item_for_sync` base64-encodes every
+    // image file and re-writes every rich_text html payload, and a sync round is triggered
+    // on each clipboard change while this scan itself is only used to build offline
+    // digests. The digest needs a content hash, and for images the hash of the raw path
+    // equals the hash of its data URL (both branches of `calc_image_hash` hash the same
+    // bytes), so hashing raw content keeps every sync_key/digest value identical.
+    // Normalization now happens lazily in `normalize_items_for_upload` right before
+    // upload (delta pushes, snapshots, http sync), which is the only place that needs it.
     let mut items: Vec<CloudSyncItem> = entries
         .into_iter()
-        .filter_map(|e| {
-            let normalized = normalize_item_for_sync(CloudSyncItem {
+        .map(|e| {
+            let content_hash = compute_sync_content_hash(&e.content_type, &e.content);
+            CloudSyncItem {
                 content_type: e.content_type,
                 content: e.content,
-                content_hash: 0,
+                content_hash,
                 deleted_at: 0,
                 html_content: e.html_content,
                 content_blob_hash: None,
@@ -1170,13 +1434,24 @@ fn collect_local_syncable_items(
                 tags: e.tags,
                 use_count: e.use_count,
                 pinned_order: e.pinned_order,
-            })?;
-            let mut item = normalized;
-            item.content_hash = compute_sync_content_hash(&item.content_type, &item.content);
-            Some(item)
+            }
         })
         .collect();
 
+    items.sort_by_key(|e| e.timestamp);
+    Ok(items)
+}
+
+/// The complete local view: history plus every tombstone.
+///
+/// Used by snapshot pushes and the http provider, which both upload the whole set. Delta rounds
+/// use [`collect_local_delta_view`] instead, which only pays for tombstones that have not
+/// settled yet.
+fn collect_local_syncable_items(
+    app: &AppHandle,
+    prefs: &CloudSyncContentPrefs,
+) -> AppResult<Vec<CloudSyncItem>> {
+    let mut items = collect_local_history_items(app, prefs)?;
     let mut tombstones = collect_local_tombstones(app, prefs)?;
     items.append(&mut tombstones);
     items.sort_by_key(|e| e.timestamp);
@@ -1242,6 +1517,154 @@ fn collect_local_tombstones(
             && prefs.includes_content_type(&item.content_type)
     });
     Ok(items)
+}
+
+/// The local view a delta round diffs against the stored index.
+///
+/// History rows always take part. Tombstones only take part while they are unsettled: a
+/// tombstone's digest is fixed at the moment its row is written, and the row stores both that
+/// digest and the one the index holds, so once the two match the row can never produce a delta
+/// again. Skipping settled rows here is what keeps a round proportional to what actually
+/// changed instead of to the ~14k tombstones on disk.
+struct LocalDeltaView {
+    items: Vec<CloudSyncItem>,
+    /// `sync_key -> digest` already cached on a pending tombstone, so it is not re-hashed.
+    tombstone_digests: HashMap<String, String>,
+    /// Every unsettled tombstone key in the view; their row state is refreshed at round end.
+    pending_tombstones: HashSet<String>,
+}
+
+/// History rows plus the tombstones that have not settled yet.
+fn collect_local_delta_view(
+    app: &AppHandle,
+    prefs: &CloudSyncContentPrefs,
+) -> AppResult<LocalDeltaView> {
+    let (mut tombstones, tombstone_digests, pending_tombstones, settled_shadowing) = {
+        let db_state = app
+            .try_state::<DbState>()
+            .ok_or_else(|| AppError::Internal("DB state unavailable".to_string()))?;
+        let conn = db_state
+            .conn
+            .lock()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        // Keep this predicate in sync with `idx_cloud_sync_tombstones_pending` (migration 13),
+        // which only makes the query cheap while the two match. A row counts as settled exactly
+        // when its digest is stored and equals the digest the index recorded for that key
+        // (`indexed_digest`, written by `cache_tombstone_digests`); settled rows are skipped here
+        // and their index rows are gone (migration 14), so they cost a round nothing at all.
+        let mut stmt = conn
+            .prepare(
+                "SELECT content_type, content_hash, deleted_at, digest
+                 FROM cloud_sync_tombstones
+                 WHERE digest IS NULL
+                    OR indexed_digest IS NULL
+                    OR digest <> indexed_digest
+                 ORDER BY deleted_at ASC",
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    CloudSyncItem {
+                        content_type: row.get(0)?,
+                        content: String::new(),
+                        content_hash: row.get(1)?,
+                        deleted_at: row.get(2)?,
+                        html_content: None,
+                        content_blob_hash: None,
+                        html_blob_hash: None,
+                        source_app: "sync".to_string(),
+                        timestamp: row.get(2)?,
+                        preview: String::new(),
+                        is_pinned: false,
+                        tags: Vec::new(),
+                        use_count: 0,
+                        pinned_order: 0,
+                    },
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        let mut tombstones = Vec::new();
+        let mut tombstone_digests = HashMap::new();
+        let mut pending_tombstones = HashSet::new();
+        for row in rows {
+            let (item, stored_digest) = row.map_err(|e| AppError::Internal(e.to_string()))?;
+            if !is_cloud_clipboard_content_type(&item.content_type)
+                || !prefs.includes_content_type(&item.content_type)
+            {
+                continue;
+            }
+            let Some(sync_key) = sync_key_for_item(&item) else {
+                continue;
+            };
+            if let Some(digest) = stored_digest {
+                tombstone_digests.insert(sync_key.clone(), digest);
+            }
+            pending_tombstones.insert(sync_key);
+            tombstones.push(item);
+        }
+
+        // Driven by the (small) history table, so the index probe runs once per live row and the
+        // result is empty on a store without such collisions.
+        let mut shadow_stmt = conn
+            .prepare(
+                "SELECT t.sync_key, t.deleted_at
+                 FROM clipboard_history h
+                 JOIN cloud_sync_tombstones t
+                   ON t.sync_key = h.content_type || ':' || h.content_hash
+                 WHERE t.digest IS NOT NULL AND t.indexed_digest = t.digest",
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let shadow_rows = shadow_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let mut settled_shadowing: HashMap<String, i64> = HashMap::new();
+        for row in shadow_rows {
+            let (sync_key, deleted_at) = row.map_err(|e| AppError::Internal(e.to_string()))?;
+            settled_shadowing
+                .entry(sync_key)
+                .and_modify(|current| *current = (*current).max(deleted_at))
+                .or_insert(deleted_at);
+        }
+
+        (
+            tombstones,
+            tombstone_digests,
+            pending_tombstones,
+            settled_shadowing,
+        )
+    };
+
+    // The connection guard above is dropped before collecting history: `DbState::conn` is a
+    // plain `Mutex`, so holding it while a helper takes it again would deadlock.
+    let mut items = collect_local_history_items(app, prefs)?;
+    // Drop live rows that a settled tombstone already deleted.
+    //
+    // A settled tombstone is not in the view and has no index row (its push state lives on its own
+    // row), so a live row sharing its key would look like a brand-new item and be re-uploaded -
+    // undeleting it on the remote - on every round. Dropping it here is the verdict the collapse
+    // used to reach on its own while settled rows still took part: the tombstone wins, because
+    // saving content clears its tombstone, so a surviving tombstone is never older than a live row
+    // with the same key.
+    items.retain(|item| match sync_key_for_item(item) {
+        Some(sync_key) => !settled_shadowing
+            .get(&sync_key)
+            .map(|deleted_at| *deleted_at >= item.timestamp)
+            .unwrap_or(false),
+        None => true,
+    });
+    items.append(&mut tombstones);
+    items.sort_by_key(|e| e.timestamp);
+    Ok(LocalDeltaView {
+        items,
+        tombstone_digests,
+        pending_tombstones,
+    })
 }
 
 fn update_existing_entry_from_sync(
@@ -1415,11 +1838,18 @@ fn apply_remote_changes(
             }
             let tombstone_ts = item.deleted_at.max(effective_timestamp);
             let _ = conn.execute(
-                "INSERT INTO cloud_sync_tombstones (content_type, content_hash, deleted_at)
-                 VALUES (?1, ?2, ?3)
+                "INSERT INTO cloud_sync_tombstones (content_type, content_hash, deleted_at, sync_key)
+                 VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(content_type, content_hash)
-                 DO UPDATE SET deleted_at = MAX(cloud_sync_tombstones.deleted_at, excluded.deleted_at)",
-                rusqlite::params![item.content_type, remote_hash, tombstone_ts],
+                 DO UPDATE SET deleted_at = MAX(cloud_sync_tombstones.deleted_at, excluded.deleted_at),
+                               digest = NULL,
+                               indexed_digest = NULL",
+                rusqlite::params![
+                    item.content_type,
+                    remote_hash,
+                    tombstone_ts,
+                    format!("{}:{}", item.content_type, remote_hash)
+                ],
             );
 
             let mut stmt = conn
@@ -2811,7 +3241,12 @@ async fn pull_remote_webdav_ops(
 }
 
 async fn sync_once_http(app: &AppHandle, cfg: &CloudSyncConfig) -> AppResult<CloudSyncStatus> {
-    let local_items = collect_local_changes(app, cfg.cursor, &cfg.content_prefs)?;
+    // this provider uploads the items directly, so they must be in upload form
+    let local_items = normalize_items_for_upload(&collect_local_changes(
+        app,
+        cfg.cursor,
+        &cfg.content_prefs,
+    )?);
     let endpoint = format!(
         "{}/api/v1/clipboard/sync",
         cfg.base_url.trim_end_matches('/')
@@ -2894,8 +3329,17 @@ async fn sync_once_webdav(
         return Ok(disabled_status());
     }
     let now = now_ms();
-    let local_items = collect_local_syncable_items(app, &cfg.content_prefs)?;
-    let (delta_items, collapsed_index) = collect_local_incremental_items(app, &local_items)?;
+    let local_view = collect_local_delta_view(app, &cfg.content_prefs)?;
+    let (delta_items, index_update) = collect_local_incremental_items(app, &local_view)?;
+    // Settled tombstones produce no delta, so caching their digest does not depend on the upload
+    // below: do it now, and it still lands when this round is cancelled or fails later.
+    store_settled_tombstone_digests(app, &index_update.settled_tombstones)?;
+    // Index bookkeeping that never needed an upload (removals only, e.g. the leftover rows of
+    // tombstone keys migration 14 could not drop). The upload path below applies it in the same
+    // transaction as the pushed digests, so it is only done here when nothing is uploaded.
+    if delta_items.is_empty() {
+        replace_local_sync_index(app, &index_update)?;
+    }
     let client = build_http_client()?;
     let paths = ensure_webdav_directories(&client, cfg).await?;
     let mut sync_head = resolve_webdav_sync_head(app, &client, cfg, &paths, now).await?;
@@ -2914,7 +3358,8 @@ async fn sync_once_webdav(
     let mut uploaded_items = 0usize;
     if !delta_items.is_empty() {
         let mut next_seq = get_local_webdav_op_seq(app);
-        let mut processed_delta = delta_items.clone();
+        // upload form: image paths -> data URLs, rich_text html local resources inlined
+        let mut processed_delta = normalize_items_for_upload(&delta_items);
         process_items_blobs_before_push(
             &client,
             cfg,
@@ -2931,8 +3376,10 @@ async fn sync_once_webdav(
             upload_webdav_ops_batch(&client, cfg, &paths.ops_path, next_seq, chunk).await?;
         }
         set_local_webdav_op_seq(app, next_seq);
-        replace_local_sync_index(app, &collapsed_index)?;
-        uploaded_items += delta_items.len();
+        replace_local_sync_index(app, &index_update)?;
+        // Count the normalized payload: an image whose file disappeared between hashing and
+        // upload is dropped by `normalize_items_for_upload` and never reaches the remote.
+        uploaded_items += processed_delta.len();
         update_webdav_head_device(&mut sync_head, &cfg.device_id, |device| {
             device.latest_op_seq = device.latest_op_seq.max(next_seq);
         });
@@ -3016,15 +3463,20 @@ async fn sync_once_webdav(
             return Ok(disabled_status());
         }
         let latest_op_seq = get_local_webdav_op_seq(app);
+        // A snapshot carries every item, settled tombstones included, so it re-collects the full
+        // local set here instead of reusing the delta view. Snapshots are minutes apart
+        // (`snapshot_interval_secs`), so the full scan is affordable.
+        let snapshot_items =
+            normalize_items_for_upload(&collect_local_syncable_items(app, &cfg.content_prefs)?);
         upload_webdav_snapshot(
             &client,
             cfg,
             &paths.devices_path,
             latest_op_seq,
-            &local_items,
+            &snapshot_items,
         )
         .await?;
-        uploaded_items += local_items.len();
+        uploaded_items += snapshot_items.len();
         update_webdav_head_device(&mut sync_head, &cfg.device_id, |device| {
             device.latest_op_seq = device.latest_op_seq.max(latest_op_seq);
             device.snapshot_updated_at = device.snapshot_updated_at.max(now_ms());
@@ -3454,8 +3906,10 @@ fn merge_remote_emojis(app: &AppHandle, remote_json: &str) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_item_for_sync, rewrite_rich_html_resources_for_sync, CloudSyncItem,
-        RICH_IMAGE_FALLBACK_PREFIX, RICH_IMAGE_FALLBACK_SUFFIX,
+        collapse_items_by_sync_key, compute_sync_content_hash, normalize_item_for_sync,
+        rewrite_rich_html_resources_for_sync, sync_digest_for_item, sync_key_for_item,
+        to_data_url_from_path, CloudSyncItem, RICH_IMAGE_FALLBACK_PREFIX,
+        RICH_IMAGE_FALLBACK_SUFFIX,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -3532,5 +3986,432 @@ mod tests {
         assert!(!html.contains("entry.png"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Guards the invariant behind deferring normalization to the upload paths: a raw item
+    /// (image = file path, rich_text = original html) must produce exactly the same sync
+    /// key and digest as the same item in upload form. If this ever breaks, every sync
+    /// round would consider the whole history changed and re-upload it.
+    #[test]
+    fn deferred_normalization_keeps_sync_key_and_digest_identical() {
+        let dir = make_temp_dir("deferred-normalize");
+        let image_path = dir.join("clip.png");
+        fs::write(&image_path, TEST_PNG_BYTES).expect("write test png");
+        let image_path_raw = image_path.to_string_lossy().to_string();
+
+        let path_hash = compute_sync_content_hash("image", &image_path_raw);
+        assert_ne!(path_hash, 0, "image path must hash");
+        let data_url = to_data_url_from_path(&image_path_raw).expect("data url");
+        assert_eq!(
+            path_hash,
+            compute_sync_content_hash("image", &data_url),
+            "path hash and data-url hash must match"
+        );
+
+        let raw = CloudSyncItem {
+            content_type: "rich_text".to_string(),
+            content: "hello".to_string(),
+            content_hash: compute_sync_content_hash("rich_text", "hello"),
+            deleted_at: 0,
+            html_content: Some(format!("<p>Hello</p><img src=\"{}\">", image_path_raw)),
+            content_blob_hash: None,
+            html_blob_hash: None,
+            source_app: "Test".to_string(),
+            timestamp: 1,
+            preview: "hello".to_string(),
+            is_pinned: false,
+            tags: vec![],
+            use_count: 0,
+            pinned_order: 0,
+        };
+        let normalized = normalize_item_for_sync(raw.clone()).expect("normalized item");
+
+        assert_eq!(sync_key_for_item(&raw), sync_key_for_item(&normalized));
+        assert_eq!(
+            sync_digest_for_item(&raw),
+            sync_digest_for_item(&normalized),
+            "deferred (raw) digest must equal the upload-form digest"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Not a correctness test: a measurement harness for the CPU-bound part of one local sync
+    /// round, shaped like the real store (1705 small rows + 242 rich_text + 81 images + 14355
+    /// tombstones = ~16.3k sync keys). Run with:
+    ///   cargo test --features portable --bin tiez-app bench_sync_round -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_sync_round_cpu_cost() {
+        use std::time::Instant;
+
+        let html = format!("<p>{}</p>", "lorem ipsum dolor sit amet ".repeat(220));
+        let mut items: Vec<CloudSyncItem> = Vec::new();
+        for i in 0..1705 {
+            items.push(CloudSyncItem {
+                content_type: if i % 3 == 0 { "url" } else { "text" }.to_string(),
+                content: format!("https://example.com/{i}/{}", "x".repeat(380)),
+                content_hash: 0,
+                deleted_at: 0,
+                html_content: None,
+                content_blob_hash: None,
+                html_blob_hash: None,
+                source_app: "chrome.exe".to_string(),
+                timestamp: 1_700_000_000_000 + i as i64,
+                preview: "y".repeat(120),
+                is_pinned: false,
+                tags: vec![],
+                use_count: 1,
+                pinned_order: 0,
+            });
+        }
+        for i in 0..242 {
+            items.push(CloudSyncItem {
+                content_type: "rich_text".to_string(),
+                content: "hello rich".to_string(),
+                content_hash: 0,
+                deleted_at: 0,
+                html_content: Some(html.clone()),
+                content_blob_hash: None,
+                html_blob_hash: None,
+                source_app: "chrome.exe".to_string(),
+                timestamp: 1_700_000_100_000 + i as i64,
+                preview: "y".repeat(120),
+                is_pinned: false,
+                tags: vec![],
+                use_count: 1,
+                pinned_order: 0,
+            });
+        }
+        for i in 0..81 {
+            items.push(CloudSyncItem {
+                content_type: "image".to_string(),
+                content: format!("C:/tiez-bench-missing-{i}.png"),
+                content_hash: 0,
+                deleted_at: 0,
+                html_content: None,
+                content_blob_hash: None,
+                html_blob_hash: None,
+                source_app: "Snipaste.exe".to_string(),
+                timestamp: 1_700_000_150_000 + i as i64,
+                preview: String::new(),
+                is_pinned: false,
+                tags: vec![],
+                use_count: 1,
+                pinned_order: 0,
+            });
+        }
+        for i in 0..14355 {
+            items.push(CloudSyncItem {
+                content_type: "text".to_string(),
+                content: String::new(),
+                content_hash: 1_000_000 + i as i64,
+                deleted_at: 1_700_000_200_000 + i as i64,
+                html_content: None,
+                content_blob_hash: None,
+                html_blob_hash: None,
+                source_app: "sync".to_string(),
+                timestamp: 1_700_000_200_000 + i as i64,
+                preview: String::new(),
+                is_pinned: false,
+                tags: vec![],
+                use_count: 0,
+                pinned_order: 0,
+            });
+        }
+        println!("items = {}", items.len());
+
+        let t = Instant::now();
+        let collapsed = collapse_items_by_sync_key(&items);
+        println!(
+            "collapse_items_by_sync_key = {:?} ({} keys)",
+            t.elapsed(),
+            collapsed.len()
+        );
+
+        let t = Instant::now();
+        let first: Vec<String> = collapsed
+            .values()
+            .map(|item| sync_digest_for_item(item))
+            .collect();
+        println!("digest pass #1             = {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let second: Vec<String> = collapsed
+            .values()
+            .map(|item| sync_digest_for_item(item))
+            .collect();
+        println!("digest pass #2             = {:?}", t.elapsed());
+        assert_eq!(first.len(), second.len());
+    }
+
+    /// Measurement harness for the settled-tombstone path added in migration 13. Unlike the bench
+    /// above it builds the real schema (so the partial index is exercised exactly as in production)
+    /// and seeds it like the live store: 14355 settled tombstones, 16373 index rows and 2034 live
+    /// rows. It measures the 0.4.7 shape (index rows for tombstones plus the anti-join that hid
+    /// them) against the 0.4.8 shape (migration 14 removes those rows, so the read is a plain scan).
+    /// Run with:
+    ///   cargo test --features portable --bin tiez-app bench_settled -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_settled_tombstone_round() {
+        use crate::infrastructure::repository::migrations::run_migrations;
+        use std::time::Instant;
+
+        const TOMBSTONES: i64 = 14355;
+        const INDEX_ROWS: i64 = 16373;
+        const LIVE_ROWS: i64 = 2034;
+
+        // Kept byte-identical to the predicate in `collect_local_delta_view`; SQLite only uses the
+        // partial index when the two match exactly, which is what this bench double-checks.
+        const PENDING_TOMBSTONES: &str = "SELECT content_type, content_hash, deleted_at, digest
+             FROM cloud_sync_tombstones
+             WHERE digest IS NULL OR indexed_digest IS NULL OR digest <> indexed_digest
+             ORDER BY deleted_at ASC";
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Live rows overlap the first `LIVE_ROWS` tombstone keys, i.e. the shadow query below runs
+        // its worst case (the live store happens to have a single such pair today).
+        for i in 0..LIVE_ROWS {
+            conn.execute(
+                "INSERT INTO clipboard_history
+                     (id, content_type, content, source_app, timestamp, preview, content_hash)
+                 VALUES (?1, 'text', ?2, 'chrome.exe', ?3, 'p', ?4)",
+                rusqlite::params![
+                    i + 1,
+                    format!("live row {i}"),
+                    1_700_000_000_000i64 + i,
+                    1_000_000 + i
+                ],
+            )
+            .unwrap();
+        }
+        for i in 0..TOMBSTONES {
+            let hash = 1_000_000 + i;
+            conn.execute(
+                "INSERT INTO cloud_sync_tombstones
+                     (content_type, content_hash, deleted_at, sync_key, digest, indexed_digest)
+                 VALUES ('text', ?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![
+                    hash,
+                    1_700_000_200_000i64 + i,
+                    format!("text:{hash}"),
+                    format!("d{i}")
+                ],
+            )
+            .unwrap();
+        }
+        // The index holds every tombstone key plus the remaining live keys, like the live store.
+        for i in 0..INDEX_ROWS {
+            let key = if i < TOMBSTONES {
+                format!("text:{}", 1_000_000 + i)
+            } else {
+                format!("url:{}", 9_000_000 + i)
+            };
+            conn.execute(
+                "INSERT INTO cloud_sync_local_index (sync_key, digest) VALUES (?1, ?2)",
+                rusqlite::params![key, format!("idx{i}")],
+            )
+            .unwrap();
+        }
+
+        // Old path: materialize every tombstone row, then digest each one.
+        let t = Instant::now();
+        let mut all_rows = 0usize;
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT content_type, content_hash, deleted_at FROM cloud_sync_tombstones
+                     ORDER BY deleted_at ASC",
+                )
+                .unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _: String = row.get(0).unwrap();
+                let _: i64 = row.get(1).unwrap();
+                let _: i64 = row.get(2).unwrap();
+                all_rows += 1;
+            }
+        }
+        println!("old: read all tombstones  = {:?} ({all_rows} rows)", t.elapsed());
+
+        // New path: only the unsettled tombstones (empty on a healthy store) are read.
+        let plan: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {PENDING_TOMBSTONES}"))
+                .unwrap();
+            let mapped = stmt.query_map([], |row| row.get::<_, String>(3)).unwrap();
+            mapped.map(|row| row.unwrap()).collect()
+        };
+        println!("pending query plan        = {plan:?}");
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_cloud_sync_tombstones_pending")),
+            "the delta view must use the partial index, otherwise it scans every tombstone"
+        );
+
+        let t = Instant::now();
+        let mut pending = 0usize;
+        {
+            let mut stmt = conn.prepare(PENDING_TOMBSTONES).unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _: String = row.get(0).unwrap();
+                pending += 1;
+            }
+        }
+        println!("new: pending tombstones   = {:?} ({pending} rows)", t.elapsed());
+
+        // Live rows whose sync key is shadowed by a settled tombstone must be dropped, otherwise
+        // they would be re-uploaded on every round (undelete loop).
+        let t = Instant::now();
+        let mut shadowed = 0usize;
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.sync_key, t.deleted_at
+                     FROM clipboard_history h
+                     JOIN cloud_sync_tombstones t
+                       ON t.sync_key = h.content_type || ':' || h.content_hash
+                     WHERE t.digest IS NOT NULL AND t.indexed_digest = t.digest",
+                )
+                .unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _: String = row.get(0).unwrap();
+                shadowed += 1;
+            }
+        }
+        println!("new: settled shadow query = {:?} ({shadowed} shadowed keys)", t.elapsed());
+
+        let t = Instant::now();
+        let mut index_rows = 0usize;
+        {
+            let mut stmt = conn
+                .prepare("SELECT sync_key, digest FROM cloud_sync_local_index")
+                .unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _: String = row.get(0).unwrap();
+                index_rows += 1;
+            }
+        }
+        println!("0.4.7: read whole index   = {:?} ({index_rows} rows)", t.elapsed());
+
+        // The query `load_local_sync_index` used in 0.4.7 and that migration 14 made unnecessary.
+        // Kept here as the baseline this change is measured against.
+        const INDEX_ANTI_JOIN: &str = "SELECT i.sync_key, i.digest FROM cloud_sync_local_index i
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM cloud_sync_tombstones t
+                 WHERE t.sync_key = i.sync_key
+                   AND t.digest IS NOT NULL
+                   AND t.indexed_digest = t.digest
+             )";
+        let plan: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {INDEX_ANTI_JOIN}"))
+                .unwrap();
+            let mapped = stmt.query_map([], |row| row.get::<_, String>(3)).unwrap();
+            mapped.map(|row| row.unwrap()).collect()
+        };
+        println!("0.4.7: index anti-join plan = {plan:?}");
+
+        let t = Instant::now();
+        let mut visible_rows = 0usize;
+        {
+            let mut stmt = conn.prepare(INDEX_ANTI_JOIN).unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _: String = row.get(0).unwrap();
+                visible_rows += 1;
+            }
+        }
+        println!("0.4.7: index anti-join     = {:?} ({visible_rows} visible rows)", t.elapsed());
+
+        // Migration 14: drop the rows a settled tombstone shadows, which is exactly what the
+        // anti-join hid. Afterwards the index read is a plain scan and the two agree.
+        conn.execute(
+            "DELETE FROM cloud_sync_local_index
+              WHERE sync_key IN (
+                  SELECT sync_key FROM cloud_sync_tombstones
+                   WHERE sync_key IS NOT NULL
+                     AND digest IS NOT NULL
+                     AND indexed_digest = digest
+              )",
+            [],
+        )
+        .unwrap();
+        let t = Instant::now();
+        let mut rows_after = 0usize;
+        {
+            let mut stmt = conn
+                .prepare("SELECT sync_key, digest FROM cloud_sync_local_index")
+                .unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let _: String = row.get(0).unwrap();
+                rows_after += 1;
+            }
+        }
+        println!("0.4.8: read whole index   = {:?} ({rows_after} rows)", t.elapsed());
+
+        // What the round then hashes: the live rows that survive the shadow filter.
+        let mut items: Vec<CloudSyncItem> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT content_type, content_hash, timestamp, preview FROM clipboard_history")
+                .unwrap();
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok(CloudSyncItem {
+                        content_type: row.get(0)?,
+                        content: String::new(),
+                        content_hash: row.get(1)?,
+                        deleted_at: 0,
+                        html_content: None,
+                        content_blob_hash: None,
+                        html_blob_hash: None,
+                        source_app: "chrome.exe".to_string(),
+                        timestamp: row.get(2)?,
+                        preview: row.get(3)?,
+                        is_pinned: false,
+                        tags: vec![],
+                        use_count: 1,
+                        pinned_order: 0,
+                    })
+                })
+                .unwrap();
+            for item in mapped {
+                items.push(item.unwrap());
+            }
+        }
+        let collapsed = collapse_items_by_sync_key(&items);
+        let t = Instant::now();
+        let digests: Vec<String> = collapsed
+            .values()
+            .map(|item| sync_digest_for_item(item))
+            .collect();
+        println!(
+            "new: digest live rows     = {:?} ({} of {} items)",
+            t.elapsed(),
+            digests.len(),
+            items.len()
+        );
+
+        assert_eq!(all_rows as i64, TOMBSTONES);
+        assert_eq!(pending, 0, "every seeded tombstone is already settled");
+        assert_eq!(index_rows as i64, INDEX_ROWS);
+        assert_eq!(
+            visible_rows as i64,
+            INDEX_ROWS - TOMBSTONES,
+            "the anti-join hid exactly the settled tombstones' rows"
+        );
+        assert_eq!(
+            rows_after as i64,
+            INDEX_ROWS - TOMBSTONES,
+            "migration 14 must remove exactly the rows the anti-join hid"
+        );
     }
 }

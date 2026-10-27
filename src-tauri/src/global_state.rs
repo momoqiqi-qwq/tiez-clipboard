@@ -49,3 +49,5 @@ pub static IS_MOUSE_BUTTON_DOWN: AtomicBool = AtomicBool::new(false);
 pub static NAVIGATION_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static NAVIGATION_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static IS_MAIN_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
+/// 拖拽导出进行中：期间必须挡住「失焦即隐藏」，否则窗口一藏拖拽立刻被取消。
+pub static DRAG_OUT_ACTIVE: AtomicBool = AtomicBool::new(false);

@@ -4,11 +4,13 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::database::{DbState, ENCRYPT_PREFIX, has_sensitive_tag, is_text_type};
 use crate::infrastructure::repository::settings_repo::SettingsRepository;
-use crate::services::auto_tag::{OFFICIAL_AUTO_TAGS, classify_auto_tags};
+use crate::services::auto_tag::{OFFICIAL_AUTO_TAGS, classify_auto_tags, is_system_tag};
 
 /// Bump when classification rules change materially so the realignment runs
 /// once more over the whole history.
-const REALIGNMENT_FLAG: &str = "db.auto_tag_realignment_v2_done";
+///
+/// v3: composition tags (纯数字/纯字母/数字字母) added for unrecognized content.
+const REALIGNMENT_FLAG: &str = "db.auto_tag_realignment_v3_done";
 
 /// One-time realignment over the entire history: re-run classification with
 /// the current rules, add missing official tags ("sensitive" is the superset
@@ -128,13 +130,11 @@ fn run_alignment(app_handle: AppHandle) {
             let desired = classify_auto_tags(&plaintext, content_type);
 
             // Category tags are system-owned: drop the ones the current rules
-            // no longer produce. "sensitive" and user tags are never removed.
+            // no longer produce (composition tags included). "sensitive" and
+            // user tags are never removed.
             let mut merged: Vec<String> = existing_tags
                 .iter()
-                .filter(|t| {
-                    !OFFICIAL_AUTO_TAGS.iter().any(|o| o.eq_ignore_ascii_case(t))
-                        || desired.iter().any(|d| d.eq_ignore_ascii_case(t))
-                })
+                .filter(|t| !is_system_tag(t) || desired.iter().any(|d| d.eq_ignore_ascii_case(t)))
                 .cloned()
                 .collect();
             let mut added: Vec<String> = Vec::new();
@@ -146,9 +146,7 @@ fn run_alignment(app_handle: AppHandle) {
                 }
             }
             for tag in &existing_tags {
-                if OFFICIAL_AUTO_TAGS.iter().any(|o| o.eq_ignore_ascii_case(tag))
-                    && !merged.iter().any(|t| t.eq_ignore_ascii_case(tag))
-                {
+                if is_system_tag(tag) && !merged.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
                     removed.push(tag.clone());
                 }
             }

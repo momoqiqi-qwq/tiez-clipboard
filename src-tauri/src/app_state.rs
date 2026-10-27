@@ -47,6 +47,14 @@ pub struct PasteQueueState {
 #[derive(Default)]
 pub struct PasteQueue(pub Mutex<PasteQueueState>);
 
+/// In-memory (non-persistent) clipboard entries.
+///
+/// Lock discipline: this mutex and `DbState::conn` must never be held at the same
+/// time. The clipboard pipeline and the history commands take the connection first
+/// and this lock second, so any code that needs both has to release one before
+/// taking the other. Holding both in the opposite order deadlocks the clipboard
+/// thread, after which every command that needs the connection blocks forever and
+/// the window never repaints.
 pub struct SessionHistory(pub Mutex<VecDeque<ClipboardEntry>>);
 
 pub struct AppDataDir(pub Mutex<std::path::PathBuf>);

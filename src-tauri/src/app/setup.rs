@@ -2,7 +2,8 @@
 use crate::app::hooks::{keyboard_proc, mouse_proc};
 #[cfg(target_os = "windows")]
 use crate::app::system::tray_subclass_proc;
-use crate::app::window_manager::{release_win_keys, restore_last_focus, toggle_window};
+use crate::app::window_lifecycle::MAIN_WINDOW_LIFECYCLE;
+use crate::app::window_manager::{mark_window_shown, release_win_keys, reveal_main_window, toggle_window};
 use crate::app_state::{
     AppDataDir, EncryptionQueueState, PasteQueue, SessionHistory, SettingsState,
 };
@@ -30,8 +31,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Shell::SetWindowSubclass;
 #[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, RegisterWindowMessageW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    GetCursorPos, GetWindowRect, IsIconic, IsWindowVisible, RegisterWindowMessageW, GWL_EXSTYLE,
+    WS_EX_NOACTIVATE,
 };
 
 static WINDOW_SIZE_SAVE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -73,6 +78,10 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     // 4. Initial Settings & Reset Safety
     apply_startup_resets(&settings_repo);
 
+    // 4.1 默认开机自启动：首次运行按默认值写入注册表，之后尊重用户在设置里的选择
+    #[cfg(target_os = "windows")]
+    apply_autostart_policy(&settings_repo);
+
     let settings = load_settings(&settings_repo);
 
     // 5. App State Management
@@ -94,7 +103,11 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     start_services(app, &settings, app_handle.clone());
 
     // 8. Tray Setup
-    setup_tray(app, settings.hide_tray_icon);
+    if let Err(error) = setup_tray(app, settings.hide_tray_icon) {
+        crate::error!("[STARTUP] Tray unavailable: {}", error);
+        // Keep the app reachable even if Windows cannot create a tray icon.
+        reveal_main_window(app.handle());
+    }
 
     // 9. Theme Initial Application
     apply_initial_theme(app);
@@ -168,6 +181,60 @@ fn apply_startup_resets(repo: &impl SettingsRepository) {
     if paste_method == "game_mode" && !crate::app::commands::system_cmd::check_is_admin() {
         info!(">>> [STARTUP] Game Mode active without Admin privileges. Resetting to default.");
         let _ = repo.set("app.paste_method", "shift_insert");
+    }
+}
+
+/// 开机自启动默认开启。
+///
+/// `app.autostart` 是产品的默认值（true），但"写注册表"这件事只做一次：
+/// 界面上关掉开关的人，数据库里可能仍是旧默认值 `true`（早期版本开关只写注册表），
+/// 于是用 `app.autostart.applied` 标记"已按默认值落过盘"，避免每次启动把用户的选择顶回去。
+/// 已落盘之后只做一件事：注册表项还在（用户要开着），但记录里的 exe 路径不是当前这个时，
+/// 把路径刷新掉 —— 便携版换目录后自启动不会指向一个已经搬走的 exe。
+#[cfg(target_os = "windows")]
+fn apply_autostart_policy(repo: &impl SettingsRepository) {
+    use crate::app::commands::system_cmd;
+
+    let applied = repo
+        .get("app.autostart.applied")
+        .ok()
+        .flatten()
+        .map(|v| v.trim() == "true")
+        .unwrap_or(false);
+
+    let desired = repo
+        .get("app.autostart")
+        .ok()
+        .flatten()
+        .map(|v| v.trim() != "false")
+        .unwrap_or(true);
+
+    if !applied {
+        if desired {
+            match system_cmd::apply_autostart(true) {
+                Ok(_) => info!(">>> [STARTUP] Autostart enabled by default."),
+                Err(e) => crate::error!(">>> [STARTUP] Failed to enable default autostart: {}", e),
+            }
+        }
+        let _ = repo.set("app.autostart", if desired { "true" } else { "false" });
+        let _ = repo.set("app.autostart.applied", "true");
+        return;
+    }
+
+    if !desired {
+        return;
+    }
+
+    if let Some(recorded) = system_cmd::current_autostart_command() {
+        if let Ok(exe) = std::env::current_exe() {
+            let exe = exe.to_string_lossy().to_string();
+            if !recorded.contains(&exe) {
+                match system_cmd::apply_autostart(true) {
+                    Ok(_) => info!(">>> [STARTUP] Autostart path refreshed to current exe."),
+                    Err(e) => crate::error!(">>> [STARTUP] Failed to refresh autostart path: {}", e),
+                }
+            }
+        }
     }
 }
 
@@ -475,13 +542,18 @@ fn setup_main_window(app: &App, s: &StartupSettings) {
 
     schedule_window_position_repair(app.handle().clone(), s.edge_docking);
 
-    // Handle silent start
+    // The native window starts hidden. React acknowledges its first commit before
+    // an explicit launch is displayed, preventing an empty transparent frame.
     let args: Vec<String> = std::env::args().collect();
     let is_autostart =
         args.contains(&"--autostart".to_string()) || args.contains(&"--minimized".to_string());
-    if !is_autostart && !s.silent_start {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
+    if let Some(window) = app.get_webview_window("main") {
+        if is_autostart || s.silent_start {
+            let _ = window.hide();
+            IS_HIDDEN.store(false, Ordering::Relaxed);
+            CURRENT_DOCK.store(0, Ordering::Relaxed);
+        } else {
+            reveal_main_window(app.handle());
         }
     }
 }
@@ -682,22 +754,33 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
 
             if !settings.edge_docking.load(Ordering::Relaxed) {
                 if IS_HIDDEN.load(Ordering::Relaxed) {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        IS_HIDDEN.store(false, Ordering::Relaxed);
-                        CURRENT_DOCK.store(0, Ordering::Relaxed);
-                    }
+                    reveal_main_window(&app_handle);
                 }
                 continue;
             }
 
             if let Some(window) = app_handle.get_webview_window("main") {
+                // Every Tauri getter (`is_visible`, `is_minimized`, `current_monitor`)
+                // is a blocking round-trip to the event loop. This loop runs 6-7 times
+                // a second for the whole life of the app, so it reads the same state
+                // straight from Win32 instead and never wakes the UI thread.
+                let hwnd = match window.hwnd() {
+                    Ok(h) => HWND(h.0),
+                    Err(_) => continue,
+                };
+
+                let (is_window_visible, is_minimized) = unsafe {
+                    (
+                        IsWindowVisible(hwnd).as_bool(),
+                        IsIconic(hwnd).as_bool(),
+                    )
+                };
+
                 // Skip if window is minimized
-                if window.is_minimized().unwrap_or(false) {
+                if is_minimized {
                     continue;
                 }
 
-                let is_window_visible = window.is_visible().unwrap_or(true);
                 let is_hidden_by_edge = IS_HIDDEN.load(Ordering::Relaxed);
 
                 // Skip edge docking checks if window was hidden by other mechanisms (paste, blur, etc.)
@@ -708,7 +791,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                 let last_show = LAST_SHOW_TIMESTAMP.load(Ordering::Relaxed);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
 
                 // While the clipboard window is actively shown via hotkey navigation,
@@ -726,12 +809,8 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                 }
 
                 let mut rect = RECT::default();
-                let hwnd = match window.hwnd() {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
                 unsafe {
-                    let _ = GetWindowRect(HWND(hwnd.0), &mut rect);
+                    let _ = GetWindowRect(hwnd, &mut rect);
                 }
 
                 let mut point = POINT::default();
@@ -739,19 +818,28 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                     let _ = GetCursorPos(&mut point);
                 }
 
-                // Get current monitor info and validate
-                let monitor = match window.current_monitor() {
-                    Ok(Some(m)) => m,
-                    _ => continue,
+                // Monitor bounds of the monitor the window sits on (physical pixels,
+                // same units GetWindowRect reports).
+                let mut monitor_info = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
                 };
-                let screen_size = monitor.size();
-                let screen_pos = monitor.position();
+                let has_monitor = unsafe {
+                    GetMonitorInfoW(
+                        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                        &mut monitor_info,
+                    )
+                    .as_bool()
+                };
+                if !has_monitor {
+                    continue;
+                }
 
                 // Calculate monitor boundaries
-                let screen_left = screen_pos.x;
-                let screen_top = screen_pos.y;
-                let screen_right = screen_pos.x + screen_size.width as i32;
-                let screen_bottom = screen_pos.y + screen_size.height as i32;
+                let screen_left = monitor_info.rcMonitor.left;
+                let screen_top = monitor_info.rcMonitor.top;
+                let screen_right = monitor_info.rcMonitor.right;
+                let screen_bottom = monitor_info.rcMonitor.bottom;
 
                 // When hidden, check if mouse is near the edge sliver
                 let threshold = 5;
@@ -826,6 +914,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                         };
 
                         if dock_actual != DockPosition::None {
+                            mark_window_shown();
                             let _ = window.show();
                             match dock_actual {
                                 DockPosition::Top => {
@@ -1006,15 +1095,15 @@ fn init_announcement_ping(app: &App, repo: &impl SettingsRepository) {
     }
 }
 
-fn setup_tray(app: &App, hide_tray: bool) {
+fn setup_tray(app: &App, hide_tray: bool) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-    let show_i = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>).unwrap();
-    let quit_i = MenuItem::with_id(app, "quit", "退出 贴汁", true, None::<&str>).unwrap();
-    let menu = Menu::with_items(app, &[&show_i, &quit_i]).unwrap();
+    let show_i = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
+    let quit_i = MenuItem::with_id(app, "quit", "退出 贴汁", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
     let icon =
-        tauri::image::Image::from_bytes(include_bytes!("../../icons/tray-icon.png")).unwrap();
+        tauri::image::Image::from_bytes(include_bytes!("../../icons/tray-icon.png"))?;
 
     let tray = TrayIconBuilder::with_id("main_tray")
         .icon(icon)
@@ -1023,9 +1112,7 @@ fn setup_tray(app: &App, hide_tray: bool) {
         .menu(&menu)
         .on_menu_event(|app, event| {
             if event.id.as_ref() == "show" {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                }
+                reveal_main_window(app);
             } else if event.id.as_ref() == "quit" {
                 app.exit(0);
             }
@@ -1033,25 +1120,18 @@ fn setup_tray(app: &App, hide_tray: bool) {
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
                 ..
             } = event
             {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64;
-                    LAST_SHOW_TIMESTAMP.store(now, Ordering::Relaxed);
-                }
+                reveal_main_window(tray.app_handle());
             }
         })
-        .build(app)
-        .expect("Failed to build tray");
+        .build(app)?;
 
     let _ = tray.set_visible(!hide_tray);
     app.manage(tray);
+    Ok(())
 }
 
 fn apply_initial_theme(app: &App) {
@@ -1090,36 +1170,58 @@ fn init_win32_hooks(_app: &App) {
                 windows::Win32::System::Threading::GetCurrentThreadId(),
                 Ordering::Relaxed,
             );
-            let h_instance = GetModuleHandleW(None).expect("Failed to get module handle");
-            let h_hook = SetWindowsHookExW(
+            let h_instance = match GetModuleHandleW(None) {
+                Ok(module) => module,
+                Err(error) => {
+                    crate::error!("[HOOK] Cannot obtain module handle: {}", error);
+                    HOOK_THREAD_ID.store(0, Ordering::Relaxed);
+                    return;
+                }
+            };
+            match SetWindowsHookExW(
                 WH_KEYBOARD_LL,
                 Some(keyboard_proc),
                 Some(HINSTANCE(h_instance.0)),
                 0,
-            )
-            .expect("Failed to set hook");
-            HOOK_HANDLE.store(h_hook.0 as _, Ordering::SeqCst);
-            let h_mouse_hook = SetWindowsHookExW(
+            ) {
+                Ok(hook) => HOOK_HANDLE.store(hook.0 as _, Ordering::SeqCst),
+                Err(error) => crate::error!("[HOOK] Keyboard hook unavailable: {}", error),
+            }
+            match SetWindowsHookExW(
                 WH_MOUSE_LL,
                 Some(mouse_proc),
                 Some(HINSTANCE(h_instance.0)),
                 0,
-            )
-            .expect("Failed to set mouse hook");
-            HOOK_MOUSE_HANDLE.store(h_mouse_hook.0 as _, Ordering::SeqCst);
+            ) {
+                Ok(hook) => HOOK_MOUSE_HANDLE.store(hook.0 as _, Ordering::SeqCst),
+                Err(error) => crate::error!("[HOOK] Mouse hook unavailable: {}", error),
+            }
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            loop {
+                let result = GetMessageW(&mut msg, None, 0, 0).0;
+                if result <= 0 {
+                    if result == -1 {
+                        crate::error!("[HOOK] Message loop failed: {}", windows::core::Error::from_win32());
+                    }
+                    break;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            let _ = UnhookWindowsHookEx(h_hook);
+            let h_hook = HOOK_HANDLE.swap(null_mut(), Ordering::SeqCst);
+            if !h_hook.is_null() {
+                let _ = UnhookWindowsHookEx(windows::Win32::UI::WindowsAndMessaging::HHOOK(
+                    h_hook as _,
+                ));
+            }
             let h_mouse = HOOK_MOUSE_HANDLE.swap(null_mut(), Ordering::SeqCst);
             if !h_mouse.is_null() {
                 let _ = UnhookWindowsHookEx(windows::Win32::UI::WindowsAndMessaging::HHOOK(
                     h_mouse as _,
                 ));
             }
+            HOOK_THREAD_ID.store(0, Ordering::Relaxed);
         }
     });
 }
@@ -1211,6 +1313,7 @@ pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
             }
             IS_MAIN_WINDOW_FOCUSED.store(*focused, Ordering::Relaxed);
             if *focused {
+                MAIN_WINDOW_LIFECYCLE.invalidate_blur();
                 #[cfg(target_os = "windows")]
                 unsafe {
                     let hwnd = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
@@ -1240,6 +1343,7 @@ pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
                 return;
             }
             api.prevent_close();
+            MAIN_WINDOW_LIFECYCLE.request_hide();
             let _ = window.hide();
             NAVIGATION_ENABLED.store(false, Ordering::SeqCst);
             NAVIGATION_MODE_ACTIVE.store(false, Ordering::SeqCst);
@@ -1261,7 +1365,7 @@ fn persist_window_size(window: &tauri::Window, width: u32, height: u32) {
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
     LAST_WINDOW_SIZE_EVENT_MS.store(now, Ordering::Relaxed);
 
@@ -1275,7 +1379,7 @@ fn persist_window_size(window: &tauri::Window, width: u32, height: u32) {
         let last_event = LAST_WINDOW_SIZE_EVENT_MS.load(Ordering::Relaxed);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         if now.saturating_sub(last_event) < 200 {
             continue;
@@ -1304,15 +1408,21 @@ fn handle_blur(window: &tauri::Window) {
     if IGNORE_BLUR.load(Ordering::Relaxed) || WINDOW_PINNED.load(Ordering::Relaxed) {
         return;
     }
+    // 正在往文件夹里拖文件，失焦是拖拽本身造成的，不能当成「点到外面去了」。
+    if crate::global_state::DRAG_OUT_ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
 
-    let settings = window.app_handle().state::<SettingsState>();
+    let Some(settings) = window.app_handle().try_state::<SettingsState>() else {
+        return;
+    };
     if settings.edge_docking.load(Ordering::Relaxed) {
         return;
     }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64;
     if now.saturating_sub(LAST_SHOW_TIMESTAMP.load(Ordering::Relaxed)) < 500 {
         return;
@@ -1331,25 +1441,43 @@ fn handle_blur(window: &tauri::Window) {
         }
     }
 
+    let generation = MAIN_WINDOW_LIFECYCLE.generation();
     let w = window.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let down = IS_MOUSE_BUTTON_DOWN.load(Ordering::SeqCst)
-            || unsafe {
-                (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01) as u16
-                    & 0x8000)
-                    != 0
-                    || (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x02) as u16
+        // Serialize the final decision with show/focus events. A worker may have
+        // queued this hide before the user reopened the nonactivating window.
+        let app = w.app_handle().clone();
+        let _ = app.run_on_main_thread(move || {
+            let down = IS_MOUSE_BUTTON_DOWN.load(Ordering::SeqCst)
+                || unsafe {
+                    (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01) as u16
                         & 0x8000)
                         != 0
-            };
-        if !down && matches!(w.is_focused(), Ok(false)) {
-            if !IGNORE_BLUR.load(Ordering::Relaxed) && !WINDOW_PINNED.load(Ordering::Relaxed) {
+                        || (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x02) as u16
+                            & 0x8000)
+                            != 0
+                };
+            let edge_docking = w.app_handle().try_state::<SettingsState>()
+                .map(|s| s.edge_docking.load(Ordering::Relaxed))
+                .unwrap_or(true);
+            if MAIN_WINDOW_LIFECYCLE.accepts_blur(generation)
+                && !down
+                && !edge_docking
+                && matches!(w.is_visible(), Ok(true))
+                && matches!(w.is_focused(), Ok(false))
+                && !DRAG_OUT_ACTIVE.load(Ordering::SeqCst)
+                && !IGNORE_BLUR.load(Ordering::Relaxed)
+                && !WINDOW_PINNED.load(Ordering::Relaxed)
+            {
+                MAIN_WINDOW_LIFECYCLE.invalidate_blur();
                 let _ = w.hide();
                 NAVIGATION_ENABLED.store(false, Ordering::SeqCst);
+                NAVIGATION_MODE_ACTIVE.store(false, Ordering::SeqCst);
                 release_win_keys();
-                let _ = restore_last_focus(w.app_handle().clone());
+                // The user selected another window. Do not steal its focus back
+                // to the old paste target after this asynchronous hide.
             }
-        }
+        });
     });
 }

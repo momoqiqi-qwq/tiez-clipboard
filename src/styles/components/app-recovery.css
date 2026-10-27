@@ -1,0 +1,46 @@
+/* A render failure must remain visible even when the selected theme is transparent. */
+.app-recovery {
+  display: flex;
+  flex: 1;
+  min-height: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  overflow: auto;
+  background: #f5f7fb;
+  color: #182235;
+  font: 14px/1.6 system-ui, sans-serif;
+}
+
+.app-recovery h1 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.4;
+}
+
+.app-recovery p {
+  margin: 0;
+}
+
+.app-recovery button {
+  padding: 9px 14px;
+  border: 1px solid #2563eb;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.app-recovery button:focus-visible {
+  outline: 2px solid #182235;
+  outline-offset: 3px;
+}
+
+:root.dark-mode .app-recovery,
+body.dark-mode .app-recovery {
+  background: #171d28;
+  color: #edf1f8;
+}

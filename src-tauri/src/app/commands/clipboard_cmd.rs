@@ -22,7 +22,7 @@ fn truncate_chars_with_suffix(text: &str, max_chars: usize, suffix: &str) -> Str
     out
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toggle_clipboard_pin(
     app_handle: AppHandle,
     state: State<'_, DbState>,
@@ -44,39 +44,50 @@ pub fn toggle_clipboard_pin(
         }
     }
 
-    let conn = state.conn.lock().unwrap();
+    let mut new_id_for_session: Option<i64> = None;
+    let mut pin_result: AppResult<()> = Ok(());
 
-    if let Some(entry) = entry_to_save {
-        let data_dir = app_data_dir.0.lock().unwrap().clone();
-        if let Ok(new_id) = state.repo.save_with_conn(&conn, &entry, Some(&data_dir)) {
-            real_id = new_id;
-            if let Ok(deleted_ids) = state.repo.enforce_limit_with_conn(&conn, Some(&data_dir)) {
-                for deleted_id in deleted_ids {
-                    let _ = app_handle.emit("clipboard-removed", deleted_id);
-                }
-            }
-            {
-                let mut session_items = session.inner().0.lock().unwrap();
-                if let Some(item) = session_items.iter_mut().find(|i| i.id == id) {
-                    item.id = new_id;
+    {
+        let conn = state.conn.lock().unwrap();
+
+        if let Some(entry) = entry_to_save {
+            let data_dir = app_data_dir.0.lock().unwrap().clone();
+            if let Ok(new_id) = state.repo.save_with_conn(&conn, &entry, Some(&data_dir)) {
+                real_id = new_id;
+                new_id_for_session = Some(new_id);
+                if let Ok(deleted_ids) = state.repo.enforce_limit_with_conn(&conn, Some(&data_dir)) {
+                    for deleted_id in deleted_ids {
+                        let _ = app_handle.emit("clipboard-removed", deleted_id);
+                    }
                 }
             }
         }
+
+        if real_id > 0 {
+            pin_result = state
+                .repo
+                .toggle_pin_with_conn(&conn, real_id, is_pinned)
+                .map_err(AppError::from);
+        }
     }
 
-    if real_id > 0 {
-        state
-            .repo
-            .toggle_pin_with_conn(&conn, real_id, is_pinned)
-            .map_err(AppError::from)?;
+    // The connection lock must be released before the session lock is taken:
+    // holding both in this order deadlocks against the paths that take the
+    // session lock first (AI edits, tag updates, paste queue).
+    if let Some(new_id) = new_id_for_session {
+        let mut session_items = session.inner().0.lock().unwrap();
+        if let Some(item) = session_items.iter_mut().find(|i| i.id == id) {
+            item.id = new_id;
+        }
     }
-    drop(conn);
+
+    pin_result?;
     let _ = app_handle.emit("clipboard-changed", ());
     crate::services::cloud_sync::request_cloud_sync(app_handle);
     Ok(real_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_tags(
     app_handle: AppHandle,
     state: State<'_, DbState>,
@@ -86,20 +97,31 @@ pub fn update_tags(
     tags: Vec<String>,
 ) -> AppResult<i64> {
     if id < 0 {
-        let mut session_items = session.inner().0.lock().unwrap();
-        if let Some(index) = session_items.iter().position(|item| item.id == id) {
-            let mut item = session_items[index].clone();
-            item.tags = tags.clone();
+        // Copy the session entry out and release the session lock before touching
+        // the database: holding SessionHistory while the connection is locked
+        // deadlocks against the clipboard pipeline, which locks them in the
+        // opposite order.
+        let mut item = {
+            let session_items = session.inner().0.lock().unwrap();
+            match session_items.iter().find(|entry| entry.id == id) {
+                Some(found) => found.clone(),
+                None => return Err(AppError::Validation("Item not found".to_string())),
+            }
+        };
+        item.tags = tags.clone();
 
-            let data_dir = app_data_dir.0.lock().unwrap().clone();
-            let new_id = state.repo.save(&item, Some(&data_dir))?;
+        let data_dir = app_data_dir.0.lock().unwrap().clone();
+        let new_id = state.repo.save(&item, Some(&data_dir))?;
 
-            session_items[index].id = new_id;
-            session_items[index].tags = tags;
-            crate::services::cloud_sync::request_cloud_sync(app_handle);
-            return Ok(new_id);
+        {
+            let mut session_items = session.inner().0.lock().unwrap();
+            if let Some(existing) = session_items.iter_mut().find(|entry| entry.id == id) {
+                existing.id = new_id;
+                existing.tags = tags;
+            }
         }
-        return Err(AppError::Validation("Item not found".to_string()));
+        crate::services::cloud_sync::request_cloud_sync(app_handle);
+        return Ok(new_id);
     }
 
     let old_sensitive = {

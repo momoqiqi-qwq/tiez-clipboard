@@ -6,7 +6,25 @@
     <title>TieZ</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main id="startup-fallback" style="position:fixed;inset:0;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;gap:16px;padding:24px;background:#f5f7fb;color:#182235;font:14px/1.6 system-ui,sans-serif;overflow:auto" role="status">
+        <h1 style="margin:0;font-size:18px">TieZ 正在加载</h1>
+        <p id="startup-message" style="margin:0">正在准备剪贴板界面…</p>
+        <button id="startup-reload" type="button" style="padding:9px 14px;border:1px solid #2563eb;border-radius:8px;background:#2563eb;color:#fff;font:inherit;cursor:pointer">重新加载界面</button>
+      </main>
+    </div>
+    <script>
+      (() => {
+        const fallback = document.getElementById('startup-fallback');
+        const message = document.getElementById('startup-message');
+        document.getElementById('startup-reload').addEventListener('click', () => location.reload());
+        const failed = () => {
+          if (fallback.isConnected) message.textContent = '界面未能完成加载，可以重新加载重试。';
+        };
+        window.addEventListener('error', failed, { once: true, capture: true });
+        setTimeout(failed, 5000);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

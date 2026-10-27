@@ -97,6 +97,9 @@ const GeneralSettingsGroup = ({
                             onChange={(e) => {
                                 const enabled = e.target.checked;
                                 setAutoStart(enabled);
+                                // 同时落库：数据库里的 app.autostart 是"用户意图"，
+                                // 启动时的默认策略只在这种意图为 true 时才补写注册表。
+                                saveAppSetting('autostart', String(enabled));
                                 invoke("toggle_autostart", { enabled }).catch(console.error);
                             }}
                         />

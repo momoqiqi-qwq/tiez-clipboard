@@ -240,6 +240,108 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (12)", [])?;
     }
 
+    // Migration 13: Cache each tombstone's sync digest so delta rounds can skip settled rows.
+    //
+    // A tombstone's digest is a pure function of (content_type, content_hash, deleted_at), all
+    // immutable once the row exists, so 14k+ tombstones re-hash to the same value on every sync
+    // round. `digest` stores that value; `indexed_digest` stores the digest of the deletion that
+    // has actually been pushed (it mirrored the index row until migration 14 dropped those), so a
+    // row is "settled" when digest = indexed_digest and can be skipped by
+    // `collect_local_delta_view` without touching the index. `sync_key` is the
+    // `content_type || ':' || content_hash` form of the index key used to relate a tombstone to the
+    // index row it shadows (migration 14 removes those rows; this migration's anti-join shaped read
+    // was dropped there because the anti-join cost more than the rows it filtered).
+    //
+    // Every writer that changes or recreates a row must clear `digest`/`indexed_digest`, and any
+    // code that clears `cloud_sync_local_index` must clear `indexed_digest`, otherwise settled
+    // tombstones would never be re-offered and deleted items could come back from the remote.
+    if current_version < 13 {
+        for (name, def) in [
+            ("sync_key", "TEXT"),
+            ("digest", "TEXT"),
+            ("indexed_digest", "TEXT"),
+        ] {
+            if !has_column(conn, "cloud_sync_tombstones", name)? {
+                conn.execute(
+                    &format!("ALTER TABLE cloud_sync_tombstones ADD COLUMN {} {}", name, def),
+                    [],
+                )?;
+            }
+        }
+        conn.execute(
+            "UPDATE cloud_sync_tombstones
+             SET sync_key = content_type || ':' || content_hash
+             WHERE sync_key IS NULL",
+            [],
+        )?;
+        // Covering index for the index-read anti-join: it probes one key at a time and filters on
+        // both digest columns, so carrying them in the index keeps the probe index-only.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cloud_sync_tombstones_sync_key
+                ON cloud_sync_tombstones (sync_key, digest, indexed_digest)",
+            [],
+        )?;
+        // Partial index over the unsettled rows only: the delta view asks for exactly this
+        // predicate, so with the index it reads the handful of pending rows instead of scanning
+        // all 14k tombstones every round. The column order also serves the view's
+        // `ORDER BY deleted_at`, and covers every column the view selects.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cloud_sync_tombstones_pending
+                ON cloud_sync_tombstones (deleted_at, content_type, content_hash, digest)
+                WHERE digest IS NULL OR indexed_digest IS NULL OR digest <> indexed_digest",
+            [],
+        )?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
+    }
+
+    // Migration 14: keep tombstone keys out of `cloud_sync_local_index`.
+    //
+    // A tombstone already carries its own push state (`digest` / `indexed_digest` from migration 13,
+    // mirrored into the index by `cache_tombstone_digests`), so an index row for it is redundant.
+    // On the live store 14355 of the 16373 index rows were exactly that, and every round had to
+    // anti-join them away in `load_local_sync_index` - measured at ~15ms, i.e. more than the ~7ms
+    // full read it filtered. Rows shadowed by an *already settled* tombstone are therefore removed
+    // here: their state survives in the columns, which hold the very digest the index held.
+    //
+    // Rows shadowed by an *unsettled* tombstone are deliberately left alone: settling those from the
+    // index (without an upload) is what keeps an upgrade from 0.4.6 and earlier from re-uploading
+    // ~14k deletion deltas. `collect_local_incremental_items` settles and removes them in the first
+    // round, and never writes an index row for a tombstone again.
+    if current_version < 14 {
+        conn.execute(
+            "DELETE FROM cloud_sync_local_index
+              WHERE sync_key IN (
+                  SELECT sync_key FROM cloud_sync_tombstones
+                   WHERE sync_key IS NOT NULL
+                     AND digest IS NOT NULL
+                     AND indexed_digest = digest
+              )",
+            [],
+        )?;
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (14)", [])?;
+    }
+
+    // Migration 15: Composition tags for content no category tag matched
+    // (纯数字 / 纯字母 / 数字字母). Classification only, never "sensitive".
+    if current_version < 15 {
+        // A store that skipped migration 4 (hand-made/partial schemas, tests) has no saved_tags
+        // yet, and the tag list below is the only thing that needs it.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS saved_tags (
+                name TEXT PRIMARY KEY,
+                color TEXT
+            )",
+            [],
+        )?;
+        for tag in crate::services::auto_tag::COMPOSITION_TAGS {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO saved_tags (name) VALUES (?1)",
+                params![tag],
+            )?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
+    }
+
     Ok(())
 }
 
@@ -392,5 +494,200 @@ mod tests {
             0,
             "AFTER DELETE trigger must drop rows from the index"
         );
+    }
+}
+
+/// Migrations 13 and 14 need their own module: the one above is
+/// `#[cfg(all(test, not(feature = "portable")))]` and this crate's tests are normally run with
+/// `--features portable`.
+#[cfg(test)]
+mod tombstone_digest_cache_migration_tests {
+    use super::*;
+
+    /// The pre-13 shape: tombstones without the digest cache, already at schema version 12.
+    fn legacy_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+            INSERT INTO schema_migrations (version) VALUES (12);
+            CREATE TABLE cloud_sync_tombstones (
+                content_type TEXT NOT NULL,
+                content_hash INTEGER NOT NULL,
+                deleted_at INTEGER NOT NULL,
+                PRIMARY KEY (content_type, content_hash)
+            );
+            INSERT INTO cloud_sync_tombstones (content_type, content_hash, deleted_at)
+            VALUES ('text', 42, 1234), ('rich_text', 3626756920440216531, 1791467867542);
+            CREATE TABLE cloud_sync_local_index (
+                sync_key TEXT PRIMARY KEY,
+                digest TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The 0.4.7 shape, i.e. schema version 13: tombstones carry the digest cache and their keys
+    /// still have rows in `cloud_sync_local_index`.
+    fn v13_db() -> Connection {
+        let conn = legacy_db();
+        conn.execute_batch(
+            "
+            ALTER TABLE cloud_sync_tombstones ADD COLUMN sync_key TEXT;
+            ALTER TABLE cloud_sync_tombstones ADD COLUMN digest TEXT;
+            ALTER TABLE cloud_sync_tombstones ADD COLUMN indexed_digest TEXT;
+            UPDATE cloud_sync_tombstones
+               SET sync_key = content_type || ':' || content_hash;
+            -- Settled: the index already recorded this deletion.
+            UPDATE cloud_sync_tombstones
+               SET digest = 'digest-a', indexed_digest = 'digest-a'
+             WHERE content_type = 'text';
+            INSERT INTO cloud_sync_local_index (sync_key, digest)
+            VALUES ('text:42', 'digest-a'), ('rich_text:3626756920440216531', 'stale');
+            DELETE FROM schema_migrations WHERE version = 12;
+            INSERT INTO schema_migrations (version) VALUES (13);
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_14_drops_index_rows_for_settled_tombstones_only() {
+        let conn = v13_db();
+        run_migrations(&conn).unwrap();
+
+        let rows: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT sync_key FROM cloud_sync_local_index ORDER BY sync_key")
+                .unwrap();
+            let mapped = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+            mapped.map(|row| row.unwrap()).collect()
+        };
+        // The settled tombstone's row is redundant (its state lives on the row); the unsettled one
+        // must survive, because settling it from the index is what keeps the first round after an
+        // upgrade from re-uploading every deletion.
+        assert_eq!(rows, vec!["rich_text:3626756920440216531".to_string()]);
+
+        // The settled columns are untouched, so no tombstone becomes pending again.
+        let settled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cloud_sync_tombstones
+                  WHERE digest IS NOT NULL AND indexed_digest = digest",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(settled, 1);
+
+        run_migrations(&conn).unwrap();
+        let max_version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(max_version, 15);
+    }
+
+    #[test]
+    fn migration_13_adds_and_backfills_the_tombstone_digest_cache() {
+        let conn = legacy_db();
+        run_migrations(&conn).unwrap();
+
+        for column in ["sync_key", "digest", "indexed_digest"] {
+            assert!(
+                has_column(&conn, "cloud_sync_tombstones", column).unwrap(),
+                "migration 13 must add cloud_sync_tombstones.{column}"
+            );
+        }
+
+        // `sync_key` has to stay byte-identical to Rust's `sync_key_for_item`/`LocalIndexUpdate`
+        // format, otherwise settled tombstones would shadow the wrong index rows.
+        let key: String = conn
+            .query_row(
+                "SELECT sync_key FROM cloud_sync_tombstones WHERE content_type = 'text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "text:42");
+
+        // Real hashes are full-width i64 values; the TEXT column must hold them verbatim.
+        let big: String = conn
+            .query_row(
+                "SELECT sync_key FROM cloud_sync_tombstones WHERE content_type = 'rich_text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(big, "rich_text:3626756920440216531");
+
+        // A fresh cache starts empty, so the first round re-derives every digest once and settles it.
+        let cached: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cloud_sync_tombstones
+                 WHERE digest IS NOT NULL OR indexed_digest IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached, 0);
+
+        // Without the partial index the delta view would scan all 14k tombstones every round.
+        let pending_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_cloud_sync_tombstones_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_index, 1, "the unsettled-tombstone partial index is required");
+
+        // Re-running must be a no-op: existing columns are kept, version 13 is recorded once.
+        run_migrations(&conn).unwrap();
+        let max_version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(max_version, 15);
+        let thirteen: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 13",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thirteen, 1);
+    }
+
+    /// Migration 15 must seed the composition tags even on a store whose saved_tags came from the
+    /// migration-11 seed list only, otherwise the tag panel has no row to show before the first
+    /// alignment pass writes entry_tags.
+    #[test]
+    fn migration_15_seeds_composition_tags() {
+        let conn = legacy_db();
+        run_migrations(&conn).unwrap();
+
+        for tag in ["纯数字", "纯字母", "数字字母"] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM saved_tags WHERE name = ?1",
+                    params![tag],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "migration 15 must seed saved_tags.{tag}");
+        }
+
+        // Re-running keeps exactly one row per tag.
+        run_migrations(&conn).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM saved_tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 3);
     }
 }

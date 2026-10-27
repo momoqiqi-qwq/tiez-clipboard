@@ -325,9 +325,7 @@ impl PipelineStage for ValidationStage {
         if settings.deduplicate.load(Ordering::Relaxed) {
             let persistent_enabled = settings.persistent.load(Ordering::Relaxed);
             let db_state = ctx.app_handle.state::<DbState>();
-            let conn = db_state.conn.lock().unwrap();
 
-            let mut existing_id = None;
             let (content, content_type, html_content) = {
                 let e = ctx.entry.as_ref().unwrap();
                 (
@@ -355,60 +353,73 @@ impl PipelineStage for ValidationStage {
                     _ => false,
                 }
             };
-            let rich_text_html_matches = |id: i64| -> bool {
-                if let Ok(Some((stored_content, c_type, h_content))) = db_state
-                    .repo
-                    .get_entry_content_with_html_with_conn(&conn, id)
-                {
-                    if c_type != "rich_text" {
-                        return false;
-                    }
-                    if htmls_equivalent(html_content.as_deref(), h_content.as_deref()) {
-                        return true;
-                    }
-                    return recent_self_copy_window
-                        && stored_content.trim().replace("\r\n", "\n") == normalized_content;
-                }
-                false
-            };
 
-            // For rich text, we want to deduplicate against all text types
-            let types_to_check = if content_type == "rich_text" {
-                vec!["rich_text", "text", "code", "url"]
-            } else {
-                vec![content_type.as_str()]
-            };
+            // The DB connection guard is scoped to this block on purpose: it must never
+            // be alive while another lock is taken. Holding it across the SessionHistory
+            // lock below inverted the lock order against callers that take SessionHistory
+            // first and the connection second (AI edits, tag updates), which deadlocked
+            // the clipboard thread and then every command that needed the connection.
+            let existing_id = {
+                let conn = db_state.conn.lock().unwrap();
 
-            for t in types_to_check {
-                if let Ok(Some(id)) =
-                    db_state
+                let rich_text_html_matches = |id: i64| -> bool {
+                    if let Ok(Some((stored_content, c_type, h_content))) = db_state
                         .repo
-                        .find_by_content_with_conn(&conn, &content, Some(t))
-                {
-                    if content_type == "rich_text"
-                        && t == "rich_text"
-                        && !rich_text_html_matches(id)
+                        .get_entry_content_with_html_with_conn(&conn, id)
                     {
-                        continue;
+                        if c_type != "rich_text" {
+                            return false;
+                        }
+                        if htmls_equivalent(html_content.as_deref(), h_content.as_deref()) {
+                            return true;
+                        }
+                        return recent_self_copy_window
+                            && stored_content.trim().replace("\r\n", "\n") == normalized_content;
                     }
-                    existing_id = Some(id);
-                    break;
-                }
-                if let Ok(Some(id)) =
-                    db_state
-                        .repo
-                        .find_by_content_with_conn(&conn, &normalized_content, Some(t))
-                {
-                    if content_type == "rich_text"
-                        && t == "rich_text"
-                        && !rich_text_html_matches(id)
+                    false
+                };
+
+                // For rich text, we want to deduplicate against all text types
+                let types_to_check = if content_type == "rich_text" {
+                    vec!["rich_text", "text", "code", "url"]
+                } else {
+                    vec![content_type.as_str()]
+                };
+
+                let mut existing_id = None;
+                for t in types_to_check {
+                    if let Ok(Some(id)) =
+                        db_state
+                            .repo
+                            .find_by_content_with_conn(&conn, &content, Some(t))
                     {
-                        continue;
+                        if content_type == "rich_text"
+                            && t == "rich_text"
+                            && !rich_text_html_matches(id)
+                        {
+                            continue;
+                        }
+                        existing_id = Some(id);
+                        break;
                     }
-                    existing_id = Some(id);
-                    break;
+                    if let Ok(Some(id)) =
+                        db_state
+                            .repo
+                            .find_by_content_with_conn(&conn, &normalized_content, Some(t))
+                    {
+                        if content_type == "rich_text"
+                            && t == "rich_text"
+                            && !rich_text_html_matches(id)
+                        {
+                            continue;
+                        }
+                        existing_id = Some(id);
+                        break;
+                    }
                 }
-            }
+
+                existing_id
+            };
 
             if persistent_enabled {
                 if let Some(id) = existing_id {
@@ -419,7 +430,7 @@ impl PipelineStage for ValidationStage {
                 }
             }
 
-            // Session history cleanup
+            // Session history cleanup (no DB connection lock is held here)
             let session_history = ctx.app_handle.state::<SessionHistory>();
             let mut removed_ids = Vec::new();
             let mut reuse_session_id: Option<i64> = None;

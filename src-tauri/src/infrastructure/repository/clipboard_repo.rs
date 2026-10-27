@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use urlencoding::decode;
 
+mod tag_search;
+
 const RICH_IMAGE_FALLBACK_PREFIX: &str = "<!--TIEZ_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX: &str = "-->";
 
@@ -210,11 +212,18 @@ impl SqliteClipboardRepository {
         }
 
         conn.execute(
-            "INSERT INTO cloud_sync_tombstones (content_type, content_hash, deleted_at)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO cloud_sync_tombstones (content_type, content_hash, deleted_at, sync_key)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(content_type, content_hash)
-             DO UPDATE SET deleted_at = MAX(cloud_sync_tombstones.deleted_at, excluded.deleted_at)",
-            params![content_type, content_hash, deleted_at],
+             DO UPDATE SET deleted_at = MAX(cloud_sync_tombstones.deleted_at, excluded.deleted_at),
+                           digest = NULL,
+                           indexed_digest = NULL",
+            params![
+                content_type,
+                content_hash,
+                deleted_at,
+                format!("{}:{}", content_type, content_hash)
+            ],
         )
         .map_err(|e| e.to_string())?;
         Ok(())

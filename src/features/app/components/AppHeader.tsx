@@ -2,6 +2,7 @@ import type { RefObject } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ChevronLeft,
+  FolderDown,
   MessageSquare,
   Pin,
   PinOff,
@@ -14,6 +15,8 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getTagColor, getTagTextColor } from "../../../shared/lib/utils";
+import TagFilterPicker from "./TagFilterPicker";
+import { parseHistorySearch } from "../../../shared/lib/historySearch";
 
 interface AppHeaderProps {
   t: (key: string) => string;
@@ -22,6 +25,8 @@ interface AppHeaderProps {
   showTagManager: boolean;
   setShowTagManager: (val: boolean) => void;
   tagManagerEnabled: boolean;
+  dragOutEnabled: boolean;
+  setDragOutEnabled: (val: boolean) => void;
   showEmojiPanel: boolean;
   setShowEmojiPanel: (val: boolean) => void;
   emojiPanelEnabled: boolean;
@@ -33,11 +38,13 @@ interface AppHeaderProps {
   showSearchBox: boolean;
   search: string;
   setSearch: (val: string) => void;
+  onCommitSearch: (val: string) => void;
   setIsComposing: (val: boolean) => void;
   searchInputRef: RefObject<HTMLInputElement | null>;
   showTagFilter: boolean;
   setShowTagFilter: (val: boolean) => void;
   allTags: string[];
+  filterTags: string[];
   searchIsFocused: boolean;
   setSearchIsFocused: (val: boolean) => void;
   setEditingTagsId: (val: number | null) => void;
@@ -57,6 +64,8 @@ const AppHeader = ({
   showTagManager,
   setShowTagManager,
   tagManagerEnabled,
+  dragOutEnabled,
+  setDragOutEnabled,
   showEmojiPanel,
   setShowEmojiPanel,
   emojiPanelEnabled,
@@ -68,11 +77,13 @@ const AppHeader = ({
   showSearchBox,
   search,
   setSearch,
+  onCommitSearch,
   setIsComposing,
   searchInputRef,
   showTagFilter,
   setShowTagFilter,
   allTags,
+  filterTags,
   searchIsFocused,
   setSearchIsFocused,
   setEditingTagsId,
@@ -95,6 +106,15 @@ const AppHeader = ({
       case "rich_text": return t('type_rich_text');
       default: return t('type_text') || 'Text';
     }
+  };
+
+  // A tag switch reuses the existing `tag:<name>` search syntax, so filtering
+  // goes through the backend tag search instead of adding a second filter state.
+  const parsedSearch = parseHistorySearch(search);
+  const activeTagFilter = parsedSearch.tagOnly ? parsedSearch.normalizedTerm : "";
+
+  const toggleTagFilter = (tag: string) => {
+    onCommitSearch(activeTagFilter && activeTagFilter === tag.trim().toLowerCase() ? "" : `tag:${tag}`);
   };
 
   return (
@@ -147,6 +167,15 @@ const AppHeader = ({
                 <Smile size={16} />
               </button>
             )}
+            <button
+              className={`btn-icon ${dragOutEnabled ? 'active' : ''}`}
+              title={dragOutEnabled
+                ? (t('drag_out_on') || '拖拽导出已开启：按住条目拖到文件夹')
+                : (t('drag_out') || '拖拽导出：可以拖动剪贴板内容到文件夹')}
+              onClick={() => setDragOutEnabled(!dragOutEnabled)}
+            >
+              <FolderDown size={16} />
+            </button>
             <button className="btn-icon" title={t('settings')} onClick={() => setShowSettings(true)}>
               <SettingsIcon size={16} />
             </button>
@@ -225,19 +254,21 @@ const AppHeader = ({
                       {allTags.map(tag => {
                         const tagBackground = getTagColor(tag, theme);
                         return (
-                          <span
+                          <button
+                            type="button"
                             className="tag-chip"
                             key={tag}
-                            onMouseDown={(e) => {
-                              e.preventDefault();
-                              setSearch("tag:" + tag);
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => {
+                              onCommitSearch("tag:" + tag);
                               setShowTagFilter(false);
                             }}
+                            title={tag}
                             data-tag={tag}
                             style={{ background: tagBackground, color: getTagTextColor(tagBackground) }}
                           >
                             {tag}
-                          </span>
+                          </button>
                         );
                       })}
                     </div>
@@ -280,6 +311,9 @@ const AppHeader = ({
                   </button>
                 ))}
               </div>
+
+              <TagFilterPicker tags={filterTags} activeTag={activeTagFilter} theme={theme}
+                t={t} onSelect={toggleTagFilter} />
 
             </div>
           </motion.div>

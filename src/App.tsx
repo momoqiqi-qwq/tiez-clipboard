@@ -9,7 +9,8 @@ import AppHeader from "./features/app/components/AppHeader";
 import AppMainContent from "./features/app/components/AppMainContent";
 import { useAppState } from "./features/app/hooks/useAppState";
 import { useSettingsPanelProps } from "./features/settings/hooks/useSettingsPanelProps";
-import { useDebounce } from "./shared/hooks/useDebounce";
+import { useSearchQuery } from "./shared/hooks/useSearchQuery";
+import HistoryFilterBar from "./features/app/components/HistoryFilterBar";
 import { useHistoryFetch } from "./shared/hooks/useHistoryFetch";
 import { useHotkeyConfig } from "./shared/hooks/useHotkeyConfig";
 import { useInputFocus } from "./shared/hooks/useInputFocus";
@@ -19,6 +20,7 @@ import { useSettingsInit } from "./shared/hooks/useSettingsInit";
 import { useSettingsPostInit } from "./shared/hooks/useSettingsPostInit";
 import { useSettingsSync } from "./shared/hooks/useSettingsSync";
 import { useTagColors } from "./shared/hooks/useTagColors";
+import { useTagList } from "./shared/hooks/useTagList";
 import { useClipboardEvents } from "./shared/hooks/useClipboardEvents";
 import { useClipboardActions } from "./shared/hooks/useClipboardActions";
 import { useMqttListener } from "./shared/hooks/useMqttListener";
@@ -363,16 +365,29 @@ const App = () => {
   const [fileTransferSourceView, setFileTransferSourceView] =
     useState<FileTransferSourceView>("clipboard");
 
-  const debouncedSearch = useDebounce(search, 400);
+  const { query: debouncedSearch, commit: commitSearch } = useSearchQuery(search, setSearch);
+  const applySearchImmediately = useCallback((value: string) => {
+    setIsComposing(false);
+    commitSearch(value);
+  }, [commitSearch, setIsComposing]);
+  const clearAllFilters = useCallback(() => {
+    applySearchImmediately("");
+    setTypeFilter(null);
+  }, [applySearchImmediately, setTypeFilter]);
+  const clearTypeFilter = useCallback(() => {
+    applySearchImmediately(search);
+    setTypeFilter(null);
+  }, [applySearchImmediately, search, setTypeFilter]);
   const searchInputRef = useInputFocus<HTMLInputElement>();
   const tagColors = useTagColors();
+  const tagList = useTagList();
   const virtualListRef = useRef<VirtualClipboardListHandle | null>(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [quickPasteHintsById, setQuickPasteHintsById] = useState<Record<number, QuickPasteHint>>(
     {}
   );
   const PAGE_SIZE = 80;
-  const { fetchHistory, loadMoreHistory } = useHistoryFetch({
+  const { fetchHistory, loadMoreHistory, retryHistory, requestState } = useHistoryFetch({
     debouncedSearch,
     typeFilter,
     persistentLimitEnabled,
@@ -500,19 +515,32 @@ const App = () => {
     [hotkey]
   );
 
-  // Compute all tags when tag manager / tag filter is open, or while editing an item's tags (quick-pick list)
+  // Backend tag list merged with the tags currently loaded in history, so a tag
+  // just added to an item shows up before the backend refresh lands.
   const allTags = useMemo(() => {
-    if (!effectiveShowTagManager && !showTagFilter && editingTagsId === null) return [];
-
     const set = new Set<string>();
+    tagList.forEach((tag) => set.add(tag.name));
     for (const tag of BUILTIN_SENSITIVE_TAG_NAMES) {
       set.add(tag);
     }
     history.forEach((item) => {
       (item.tags || []).forEach((tag) => set.add(tag));
     });
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [history, effectiveShowTagManager, showTagFilter, editingTagsId]);
+    return Array.from(set);
+  }, [history, tagList]);
+
+  // Tags offered as header switches. Official tags are seeded with a zero count,
+  // so drop the ones with no entries; the backend order (most used first) is kept.
+  const filterTags = useMemo(() => {
+    const set = new Set<string>();
+    tagList.forEach((tag) => {
+      if (tag.count > 0) set.add(tag.name);
+    });
+    history.forEach((item) => {
+      (item.tags || []).forEach((tag) => set.add(tag));
+    });
+    return Array.from(set);
+  }, [history, tagList]);
 
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
@@ -544,6 +572,18 @@ const App = () => {
 
 
   const { toasts, pushToast, confirmDialog, openConfirm, closeConfirm } = useOverlays();
+
+  // ── 拖拽导出：开启后按住任意条目，直接把内容拖成文件（拖到文件夹里）──
+  const [dragOutEnabled, setDragOutEnabled] = useState(false);
+  const handleStartDragOut = useCallback(
+    (item: ClipboardEntry) => {
+      invoke("start_drag_out", { id: item.id }).catch((error) => {
+        console.error("start_drag_out failed:", error);
+        pushToast(`${t("drag_out_failed")}${String(error)}`);
+      });
+    },
+    [pushToast, t]
+  );
 
   useSoundEffects({ soundEnabled, pasteSoundEnabled, soundVolume });
 
@@ -783,7 +823,11 @@ const App = () => {
     setQuickPasteHintsById(seededHints);
 
     invoke<ClipboardEntry[]>("get_clipboard_history", {
-      limit: 256,
+      // Only the first QUICK_PASTE_KEYS.length entries can ever receive a slot badge
+      // (`buildQuickPasteHintsById` slices exactly that many), and every extra row costs
+      // decryption + DTO mapping on the backend. This used to ask for 256 rows on every
+      // single clipboard change.
+      limit: QUICK_PASTE_KEYS.length,
       offset: 0,
       contentType: null
     })
@@ -949,7 +993,13 @@ const App = () => {
     typeFilter
   });
 
-  const effectiveHasMore = hasMore && filteredHistory.length >= PAGE_SIZE;
+  // The backend lookahead determines exhaustion, not the visible filtered count.
+  const effectiveHasMore = hasMore;
+  const historyPending = isComposing || search !== debouncedSearch
+    || requestState.queryKey !== JSON.stringify([debouncedSearch, typeFilter])
+    || requestState.phase === "loading";
+  const historyFailed = !historyPending && requestState.phase === "error";
+  const hasActiveFilters = search.trim().length > 0 || !!typeFilter;
 
   const { pinnedItems, unpinnedItems, handlePinnedReorder } = usePinnedSort({
     filteredHistory,
@@ -1007,6 +1057,8 @@ const App = () => {
     sensitiveMaskSuffixVisible,
     sensitiveMaskEmailDomain,
     quickPasteHintsById,
+    dragOutEnabled,
+    onStartDragOut: handleStartDragOut,
     processingAiId,
     aiEnabled,
     aiOptionsOpenId,
@@ -1057,6 +1109,8 @@ const App = () => {
         showTagManager={effectiveShowTagManager}
         setShowTagManager={setShowTagManager}
         tagManagerEnabled={tagManagerEnabled}
+        dragOutEnabled={dragOutEnabled}
+        setDragOutEnabled={setDragOutEnabled}
         showEmojiPanel={effectiveShowEmojiPanel}
         setShowEmojiPanel={setShowEmojiPanel}
         emojiPanelEnabled={emojiPanelEnabled}
@@ -1068,11 +1122,13 @@ const App = () => {
         showSearchBox={showSearchBox}
         search={search}
         setSearch={setSearch}
+        onCommitSearch={applySearchImmediately}
         setIsComposing={setIsComposing}
         searchInputRef={searchInputRef}
         showTagFilter={showTagFilter}
         setShowTagFilter={setShowTagFilter}
         allTags={allTags}
+        filterTags={filterTags}
         searchIsFocused={searchIsFocused}
         setSearchIsFocused={setSearchIsFocused}
         setEditingTagsId={setEditingTagsId}
@@ -1093,6 +1149,15 @@ const App = () => {
         }}
         onWheel={handleMainWheel}
       >
+        {!showSettings && !effectiveShowTagManager && !effectiveShowEmojiPanel && (
+          <HistoryFilterBar
+            t={t} search={search} typeFilter={typeFilter} count={filteredHistory.length}
+            hasMore={effectiveHasMore} status={historyPending ? "loading" : historyFailed ? "error" : "ready"}
+            loadingMore={isLoadingMore} limited={requestState.limited} hasSavedData={history.length > 0}
+            onClearSearch={() => applySearchImmediately("")} onClearType={clearTypeFilter}
+            onClearAll={clearAllFilters} onRetry={retryHistory} onLoadMore={loadMoreHistory}
+          />
+        )}
         <AppMainContent
           t={t}
           theme={theme}
@@ -1110,6 +1175,9 @@ const App = () => {
           setEmojiPanelTab={setEmojiPanelTab}
           saveSetting={saveSetting}
           filteredHistory={filteredHistory}
+          suppressEmptyState={historyPending || historyFailed || hasActiveFilters}
+          scrollContextKey={JSON.stringify([search, typeFilter, compactMode, theme, language, privacyProtection, richTextSnapshotPreview])}
+          scrollLayoutVersion={appSettings}
           search={search}
           pinnedItems={pinnedItems}
           unpinnedItems={unpinnedItems}
@@ -1121,7 +1189,7 @@ const App = () => {
           renderItemContent={renderItemContent}
           loadMoreHistory={loadMoreHistory}
           handleListScroll={handleListScroll}
-          hasMore={effectiveHasMore}
+          hasMore={effectiveHasMore && !historyPending && !historyFailed}
           isLoadingMore={isLoadingMore}
           showScrollTop={showScrollTopVisible}
           onScrollTop={handleScrollTop}

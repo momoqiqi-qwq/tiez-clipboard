@@ -175,6 +175,46 @@
     display: none;
 }
 
+/* --- Header tag switches ---
+   Second row of the search area, under the content-type switches. Clicking one
+   filters the list by that tag; clicking the active one clears the filter. */
+.header-tag-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 0 0 0;
+    min-width: 0;
+}
+
+.header-tag-row-label {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    color: var(--text-secondary);
+    opacity: 0.55;
+}
+
+.header-tag-row-scroll {
+    display: flex;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
+.header-tag-chip {
+    font-weight: 600;
+}
+
+.header-tag-chip-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
 /* --- Retro-specific accents --- */
 .theme-retro .tag-chip {
     font-weight: 800;

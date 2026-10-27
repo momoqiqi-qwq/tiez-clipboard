@@ -1,7 +1,24 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { parseHistorySearch } from "../lib/historySearch";
 import type { Dispatch, SetStateAction } from "react";
 import type { ClipboardEntry } from "../types";
+
+// Reject malformed IPC responses before they reach sorting and rendering.
+const validateHistory = (value: unknown): ClipboardEntry[] => {
+  if (!Array.isArray(value) || value.some((item) =>
+    !item || typeof item !== "object" ||
+    !Number.isFinite(item.id) || !Number.isFinite(item.timestamp) ||
+    typeof item.content_type !== "string" || typeof item.is_pinned !== "boolean" ||
+    (item.content != null && typeof item.content !== "string") ||
+    (item.source_app != null && typeof item.source_app !== "string") ||
+    (item.tags != null && (!Array.isArray(item.tags) ||
+      item.tags.some((tag: unknown) => typeof tag !== "string")))
+  )) {
+    throw new Error("Invalid clipboard history response");
+  }
+  return value;
+};
 
 interface UseHistoryFetchOptions {
   debouncedSearch: string;
@@ -34,11 +51,29 @@ export const useHistoryFetch = ({
   hasMore,
   setIsLoadingMore
 }: UseHistoryFetchOptions) => {
+  const [requestState, setRequestState] = useState<{
+    phase: "loading" | "ready" | "error";
+    queryKey: string;
+    limited: boolean;
+  }>({ phase: "loading", queryKey: "", limited: false });
+  const errorRef = useRef<{ reset: boolean; queryKey: string } | null>(null);
+  const queryKey = JSON.stringify([debouncedSearch, typeFilter]);
+  const mountedRef = useRef(true);
   const loadingRef = useRef(false);
+  const resetPendingRef = useRef(false);
+  const loadedTagQueryRef = useRef<string | null>(null);
   const fetchSeqRef = useRef(0);
   const lastRequestedOffsetRef = useRef<number | null>(null);
   const currentOffsetRef = useRef(currentOffset);
   const historyLengthRef = useRef(historyLength);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      ++fetchSeqRef.current;
+    };
+  }, []);
 
   useEffect(() => {
     currentOffsetRef.current = currentOffset;
@@ -49,7 +84,11 @@ export const useHistoryFetch = ({
   }, [historyLength]);
   const fetchHistory = useCallback(
     async (reset = false) => {
+      if (!mountedRef.current || (!reset && resetPendingRef.current)) return;
+      if (reset) resetPendingRef.current = true;
       const seq = ++fetchSeqRef.current;
+      errorRef.current = null;
+      setRequestState({ phase: "loading", queryKey, limited: false });
       try {
         if (reset) {
           lastRequestedOffsetRef.current = null;
@@ -61,58 +100,84 @@ export const useHistoryFetch = ({
 
         let data: ClipboardEntry[] = [];
 
-        const hasSearch = debouncedSearch && debouncedSearch.trim().length > 0;
+        const { term, tagOnly } = parseHistorySearch(debouncedSearch);
 
-        if (hasSearch) {
-          let term = debouncedSearch;
-          let tagOnly = false;
-          if (term.startsWith("tag:")) {
-            term = term.slice(4);
-            tagOnly = true;
-          }
-
-          try {
-            data = await invoke<ClipboardEntry[]>("search_clipboard_history", {
-              searchTerm: term,
-              limit: 200,
-              tagOnly
+        if (term && tagOnly) {
+          // Offset counts the merged search results, including transient id=0 entries.
+          const queryKey = JSON.stringify([term.toLowerCase(), typeFilter]);
+          const replace = reset || loadedTagQueryRef.current !== queryKey;
+          const offset = replace ? 0 : currentOffsetRef.current;
+          const response = await invoke<unknown>("search_clipboard_history", {
+            searchTerm: term,
+            limit: pageSize + 1,
+            offset,
+            tagOnly: true,
+            contentType: typeFilter || undefined
+          });
+          if (seq !== fetchSeqRef.current) return;
+          const rawData = validateHistory(response);
+          const hasMoreNow = rawData.length > pageSize;
+          const page = rawData.slice(0, pageSize);
+          loadedTagQueryRef.current = queryKey;
+          if (replace) {
+            setHistory(page);
+          } else {
+            setHistory((prev) => {
+              const seen = new Set(prev.filter(item => item.id !== 0).map(item => item.id));
+              const next = page.filter(item => {
+                if (item.id === 0) return true;
+                if (seen.has(item.id)) return false;
+                seen.add(item.id);
+                return true;
+              });
+              return next.length ? [...prev, ...next] : prev;
             });
-          } catch (e) {
-            console.error("Search failed, falling back", e);
-            data = [];
           }
+          // Advance by consumed rows, not deduplicated visible rows.
+          currentOffsetRef.current = offset + page.length;
+          setCurrentOffset(currentOffsetRef.current);
+          setHasMore(hasMoreNow);
+        } else if (term) {
+          const response = await invoke<unknown>("search_clipboard_history", {
+            searchTerm: term,
+            limit: 200,
+            tagOnly
+          });
 
           if (seq !== fetchSeqRef.current) return;
+          data = validateHistory(response);
+          loadedTagQueryRef.current = null;
           // Search results are not paginated; always replace list and stop infinite loading.
           setHistory(data);
           setCurrentOffset(data.length);
           setHasMore(false);
         } else {
           const requestedLimit = pageSize + 1; // Use standard page size for DB limit
-          const rawData = await invoke<ClipboardEntry[]>("get_clipboard_history", {
+          const response = await invoke<unknown>("get_clipboard_history", {
             limit: requestedLimit,
             offset: baseOffset,
-            content_type: typeFilter || undefined
+            contentType: typeFilter || undefined
           });
 
           if (seq !== fetchSeqRef.current) return;
 
+          const rawData = validateHistory(response);
           const hasMoreNow = rawData.length > pageSize;
           const data = hasMoreNow ? rawData.slice(0, pageSize) : rawData;
 
           // Calculate how many DB items we actually retrieved (id > 0)
           // This is critical for the next offset to be correct
           const dbItemsCount = data.filter(item => item.id > 0).length;
+          loadedTagQueryRef.current = null;
 
           if (reset) {
             setHistory(data);
             setCurrentOffset(dbItemsCount);
             setHasMore(hasMoreNow);
           } else {
-            let nextItems: ClipboardEntry[] = [];
             setHistory((prev) => {
               const existingIds = new Set(prev.map((item) => item.id));
-              nextItems = data.filter((item) => !existingIds.has(item.id) || item.id === 0);
+              const nextItems = data.filter((item) => !existingIds.has(item.id) || item.id === 0);
 
               if (nextItems.length === 0) return prev;
               return [...prev, ...nextItems];
@@ -125,13 +190,22 @@ export const useHistoryFetch = ({
             setHasMore(hasMoreNow);
           }
         }
+        setRequestState({ phase: "ready", queryKey, limited: !!term && !tagOnly && data.length >= 200 });
       } catch (err) {
+        // A failed obsolete request must not change the current query's state.
+        if (seq !== fetchSeqRef.current) return;
+        errorRef.current = { reset: reset || !loadingRef.current, queryKey };
+        setRequestState({ phase: "error", queryKey, limited: false });
         console.error("无法获取历史记录", err);
-        setHasMore(false);
+        // Preserve the last valid list/offset/hasMore and allow a deliberate retry.
+        lastRequestedOffsetRef.current = null;
+      } finally {
+        if (reset && seq === fetchSeqRef.current) resetPendingRef.current = false;
       }
     },
     [
       debouncedSearch,
+      queryKey,
       typeFilter,
       pageSize,
       persistentLimit,
@@ -142,11 +216,15 @@ export const useHistoryFetch = ({
     ]
   );
 
-  const loadMoreHistory = useCallback(async () => {
-    if (loadingRef.current || isLoadingMore || !hasMore) return;
-    if (debouncedSearch && debouncedSearch.trim().length > 0) return;
+  const loadMoreHistory = useCallback(async (retry = false) => {
+    if (!mountedRef.current || resetPendingRef.current || loadingRef.current || isLoadingMore || !hasMore) return;
+    if (errorRef.current && !retry) return;
+    const { term, tagOnly } = parseHistorySearch(debouncedSearch);
+    if (term && !tagOnly) return;
 
-    const effectiveOffset = Math.min(currentOffsetRef.current, historyLengthRef.current);
+    const effectiveOffset = term && tagOnly
+      ? (loadedTagQueryRef.current === JSON.stringify([term.toLowerCase(), typeFilter]) ? currentOffsetRef.current : 0)
+      : Math.min(currentOffsetRef.current, historyLengthRef.current);
     if (lastRequestedOffsetRef.current === effectiveOffset) return;
     lastRequestedOffsetRef.current = effectiveOffset;
 
@@ -156,10 +234,20 @@ export const useHistoryFetch = ({
       await fetchHistory(false);
     } finally {
       loadingRef.current = false;
-      setIsLoadingMore(false);
+      if (mountedRef.current) setIsLoadingMore(false);
     }
-  }, [debouncedSearch, fetchHistory, hasMore, isLoadingMore, setIsLoadingMore]);
+  }, [debouncedSearch, typeFilter, fetchHistory, hasMore, isLoadingMore, setIsLoadingMore]);
 
-  return { fetchHistory, loadMoreHistory };
+  const retryHistory = useCallback(async () => {
+    if (resetPendingRef.current || loadingRef.current) return;
+    const error = errorRef.current;
+    if (error && error.queryKey === queryKey && !error.reset) {
+      await loadMoreHistory(true);
+    } else {
+      await fetchHistory(true);
+    }
+  }, [fetchHistory, loadMoreHistory, queryKey]);
+
+  return { fetchHistory, loadMoreHistory, retryHistory, requestState };
 };
 

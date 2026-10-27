@@ -1,4 +1,5 @@
 import type { MouseEvent, ReactNode } from "react";
+import type { StateSnapshot } from "react-virtuoso";
 import type { DragControls } from "framer-motion";
 import type { ClipboardEntry, Locale } from "../../shared/types";
 
@@ -30,6 +31,9 @@ export interface ClipboardItemProps {
   sensitiveMaskSuffixVisible?: number;
   sensitiveMaskEmailDomain?: boolean;
   quickPasteHint?: QuickPasteHint;
+  /** 拖拽导出模式：按住条目直接把它拖成文件（拖到文件夹里） */
+  dragOutEnabled?: boolean;
+  onStartDragOut?: (item: ClipboardEntry) => void;
 
   onSelect: () => void;
   onCopy: (withFormat?: boolean) => void;
@@ -70,6 +74,8 @@ export interface VirtualClipboardListProps {
   onScroll?: (offset: number) => void;
   compactMode: boolean;
   header?: ReactNode;
+  restoreStateFrom?: StateSnapshot;
+  onStateChange?: (state: StateSnapshot) => void;
 }
 
 export interface VirtualClipboardListHandle {

@@ -28,6 +28,9 @@ interface UseClipboardItemRendererOptions {
   sensitiveMaskSuffixVisible: number;
   sensitiveMaskEmailDomain: boolean;
   quickPasteHintsById: Record<number, QuickPasteHint>;
+  /** 拖拽导出模式：按住条目就把它落成文件交给 OLE */
+  dragOutEnabled: boolean;
+  onStartDragOut: (item: ClipboardEntry) => void;
   processingAiId: number | null;
   aiEnabled: boolean;
   aiOptionsOpenId: number | null;
@@ -78,6 +81,8 @@ export const useClipboardItemRenderer = ({
   sensitiveMaskSuffixVisible,
   sensitiveMaskEmailDomain,
   quickPasteHintsById,
+  dragOutEnabled,
+  onStartDragOut,
   processingAiId,
   aiEnabled,
   aiOptionsOpenId,
@@ -126,6 +131,8 @@ export const useClipboardItemRenderer = ({
           sensitiveMaskSuffixVisible={sensitiveMaskSuffixVisible}
           sensitiveMaskEmailDomain={sensitiveMaskEmailDomain}
           quickPasteHint={quickPasteHintsById[item.id]}
+          dragOutEnabled={dragOutEnabled}
+          onStartDragOut={() => onStartDragOut(item)}
           onSelect={() => setSelectedIndex(index)}
           onCopy={(withFormat) =>
             copyToClipboard(item.id, item.content, item.content_type, withFormat, item.is_pinned, item.tags || [])
@@ -216,6 +223,8 @@ export const useClipboardItemRenderer = ({
       sensitiveMaskSuffixVisible,
       sensitiveMaskEmailDomain,
       quickPasteHintsById,
+      dragOutEnabled,
+      onStartDragOut,
       processingAiId,
       aiEnabled,
       aiOptionsOpenId,

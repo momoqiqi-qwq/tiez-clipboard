@@ -20,7 +20,11 @@ interface TagInfo {
 
 // Official tags: seeded/managed by the backend, auto-assigned by content
 // classification, and protected from rename/delete in the UI.
-const OFFICIAL_TAGS = ['sensitive', '密码', '网站', '手机号', '邮箱', 'apikey', '网盘'];
+// The last three are composition tags for content no category tag matched.
+const OFFICIAL_TAGS = [
+    'sensitive', '密码', '网站', '手机号', '邮箱', 'apikey', '网盘',
+    '纯数字', '纯字母', '数字字母',
+];
 const isOfficialTag = (name: string) => OFFICIAL_TAGS.includes(name);
 
 const TAG_MANAGER_VIEW_MODE_KEY = "tiez_tag_manager_view_mode";
@@ -67,7 +71,19 @@ export default function TagManager({ t, theme }: TagManagerProps) {
     const containerRef = useRef<HTMLDivElement>(null);
 
     const selectedTagRef = useRef<string | null>(null);
+    const mountedRef = useRef(true);
+    const tagsRequestRef = useRef(0);
+    const itemsRequestRef = useRef(0);
     useEffect(() => { selectedTagRef.current = selectedTag; }, [selectedTag]);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            tagsRequestRef.current++;
+            itemsRequestRef.current++;
+        };
+    }, []);
 
     useEffect(() => {
         try {
@@ -78,20 +94,22 @@ export default function TagManager({ t, theme }: TagManagerProps) {
     }, [viewMode]);
 
     useEffect(() => {
-        let unlisteners: (() => void)[] = [];
-        const setupListeners = async () => {
-            const handleUpdate = () => {
-                // Don't refresh if we're in the middle of a delete operation
-                if (isDeleting) return;
-                fetchTags();
-                if (selectedTagRef.current) loadTagItems(selectedTagRef.current);
-            };
-            unlisteners.push(await listen('clipboard-changed', handleUpdate));
-            unlisteners.push(await listen('clipboard-updated', handleUpdate));
-            unlisteners.push(await listen('clipboard-removed', handleUpdate));
+        let disposed = false;
+        const handleUpdate = () => {
+            if (disposed || isDeleting) return;
+            void fetchTags(true);
         };
-        setupListeners();
-        return () => unlisteners.forEach(f => f());
+        const unlisteners = ['clipboard-changed', 'clipboard-updated', 'clipboard-removed', 'tags-changed']
+            .map(event => listen(event, handleUpdate).catch(error => {
+                if (!disposed) console.error('Failed to subscribe to tag manager updates', error);
+                return null;
+            }));
+        return () => {
+            disposed = true;
+            unlisteners.forEach(pending => {
+                pending.then(unlisten => unlisten?.()).catch(console.error);
+            });
+        };
     }, [isDeleting]);
 
     useEffect(() => { fetchTags(); }, []);
@@ -153,12 +171,15 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         };
     }, [isResizing, isStacked]);
 
-    const fetchTags = async () => {
+    const fetchTags = async (refreshItems = false) => {
+        if (!mountedRef.current) return;
+        const request = ++tagsRequestRef.current;
         try {
             const [tagMap, colors] = await Promise.all([
                 invoke<Record<string, number>>('get_all_tags_info'),
                 invoke<Record<string, string>>('get_tag_colors')
             ]);
+            if (!mountedRef.current || request !== tagsRequestRef.current) return;
 
             const tagArray = Object.entries(tagMap).map(([name, count]) => ({ name, count }));
             tagArray.sort((a, b) => b.count - a.count);
@@ -167,24 +188,48 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
             const activeTag = selectedTagRef.current;
             if (tagArray.length === 0) {
+                selectedTagRef.current = null;
+                itemsRequestRef.current++;
                 setSelectedTag(null);
                 setTagItems([]);
+                setSelectedItemIds(new Set());
+                setItemDeleteConfirmation({ show: false, id: null });
+                setLoading(false);
                 return;
             }
             if (!activeTag || !tagArray.some(tag => tag.name === activeTag)) {
-                loadTagItems(tagArray[0].name);
+                void loadTagItems(tagArray[0].name);
+            } else if (refreshItems) {
+                void loadTagItems(activeTag);
             }
-        } catch (err) { console.error(err); }
+        } catch (err) {
+            if (mountedRef.current && request === tagsRequestRef.current) console.error(err);
+        }
     };
 
     const loadTagItems = async (tagName: string) => {
+        if (!mountedRef.current) return;
+        const request = ++itemsRequestRef.current;
+        if (selectedTagRef.current !== tagName) {
+            setTagItems([]);
+            setSelectedItemIds(new Set());
+            setItemDeleteConfirmation({ show: false, id: null });
+        }
+        selectedTagRef.current = tagName;
         setLoading(true);
         setSelectedTag(tagName);
         try {
             const items = await invoke<ClipboardEntry[]>('get_tag_items', { tag: tagName });
+            if (!mountedRef.current || request !== itemsRequestRef.current) return;
             setTagItems(items || []);
-        } catch (err) { console.error(err); setTagItems([]); }
-        finally { setLoading(false); }
+        } catch (err) {
+            if (mountedRef.current && request === itemsRequestRef.current) {
+                console.error(err);
+                setTagItems([]);
+            }
+        } finally {
+            if (mountedRef.current && request === itemsRequestRef.current) setLoading(false);
+        }
     };
 
     const createTag = async (rawName: string) => {
@@ -193,6 +238,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
         try {
             await invoke('create_new_tag', { tagName: trimmed });
+            await emit('tags-changed');
             setNewTagName('');
             setTagSearch('');
             await fetchTags();
@@ -211,6 +257,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
 
         try {
             await invoke('rename_tag_globally', { oldName, newName: trimmed });
+            await emit('tags-changed');
             if (selectedTag === oldName) setSelectedTag(trimmed);
             await fetchTags();
             await loadTagItems(trimmed);
@@ -224,6 +271,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
         setIsDeleting(true);
         try {
             await invoke('delete_tag_from_all', { tagName });
+            await emit('tags-changed');
             await emit('clipboard-changed'); // Notify App.tsx to refresh
             await fetchTags();
         } catch (err) { console.error(err); }
@@ -265,7 +313,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
     };
 
     const filteredTags = useMemo(() => {
-        return tags.filter(t => t.name.toLowerCase().includes(tagSearch.toLowerCase()));
+        return tags.filter(t => t.name.toLowerCase().includes(tagSearch.trim().toLowerCase()));
     }, [tags, tagSearch]);
 
     const normalizedTagSearch = tagSearch.trim().toLowerCase();
@@ -321,7 +369,9 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                             onFocus={() => invoke('activate_window_focus').catch(console.error)}
                             onChange={e => setTagSearch(e.target.value)}
                             onKeyDown={async (e) => {
+                                if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
                                 if (e.key === 'Enter' && tagSearch.trim()) {
+                                    e.preventDefault();
                                     // If exact match exists, select it. If not, create new.
                                     const exactMatch = tags.find(t => t.name.toLowerCase() === normalizedTagSearch);
                                     if (exactMatch) {
@@ -336,13 +386,15 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                             <div className="action-icons">
                                 { /* If no exact match, show Plus to indicate creation */}
                                 {canCreateTag ? (
-                                    <span
+                                    <button
+                                        type="button"
+                                        aria-label={t('create_new_tag_tooltip')}
                                         title={t('create_new_tag_tooltip')}
                                         className="action-icon create"
                                         onClick={() => createTag(tagSearch)}
                                     >
                                         <Plus size={12} />
-                                    </span>
+                                    </button>
                                 ) : null}
                                 <X size={12} className="action-icon clear" onClick={() => setTagSearch('')} />
                             </div>
@@ -386,7 +438,9 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                                     onChange={(e) => setNewTagName(e.target.value)}
                                     autoFocus
                                     onKeyDown={async (e) => {
+                                        if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
                                         if (e.key === 'Enter') {
+                                            e.preventDefault();
                                             await handleRenameTag(tag.name);
                                         } else if (e.key === 'Escape') {
                                             setEditingTag(null);
@@ -881,7 +935,7 @@ export default function TagManager({ t, theme }: TagManagerProps) {
                 .action-icons { display: flex; align-items: center; gap: 4px; }
                 .action-icon { cursor: pointer; opacity: 0.5; color: var(--text-primary); transition: all 0.15s; }
                 .action-icon:hover { opacity: 1; transform: scale(1.1); }
-                .action-icon.create { color: var(--accent-color); opacity: 0.8; }
+                .action-icon.create { color: var(--accent-color); opacity: 0.8; border: none; background: transparent; padding: 0; display: inline-flex; align-items: center; justify-content: center; box-shadow: none; }
                 .action-icon.create:hover { opacity: 1; }
 
                 .tag-scroll { flex: 1; overflow-y: auto; padding: 8px; overflow-x: hidden; }

@@ -580,6 +580,9 @@ mod tests {
                 content_type TEXT NOT NULL,
                 content_hash INTEGER NOT NULL,
                 deleted_at INTEGER NOT NULL,
+                sync_key TEXT,
+                digest TEXT,
+                indexed_digest TEXT,
                 PRIMARY KEY (content_type, content_hash)
             )",
             [],

@@ -11,14 +11,33 @@ pub const OFFICIAL_AUTO_TAGS: &[&str] = &["网站", "手机号", "邮箱", "apik
 /// also carries "sensitive" — sensitive is the superset of all category tags.
 const CATEGORY_PRIORITY: &[&str] = &["apikey", "手机号", "邮箱", "网盘", "网站"];
 
+/// Composition tags, assigned only when NO category tag matched: they bucket
+/// the leftovers ("未识别") by character makeup so opaque tokens — order ids,
+/// hashes, invite codes — stay groupable. They never imply "sensitive": they
+/// only group, they do not encrypt.
+pub const COMPOSITION_TAGS: &[&str] = &["纯数字", "纯字母", "数字字母"];
+
 const PATTERN_SCAN_MAX_BYTES: usize = 5000;
 
+/// Longer than this is a document, not a token; bucketing prose by character
+/// makeup would only add noise.
+const COMPOSITION_MAX_BYTES: usize = 1000;
+
+/// Shortest content worth bucketing — one or two characters is never a token.
+const COMPOSITION_MIN_CHARS: usize = 3;
+
 pub fn is_official_tag(name: &str) -> bool {
-    name == "sensitive"
-        || name == "密码"
-        || OFFICIAL_AUTO_TAGS
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(name))
+    name == "sensitive" || name == "密码" || is_system_tag(name)
+}
+
+/// Tags the classifier owns at runtime (category + composition), as opposed to
+/// tags the user created. System tags are seeded at migration time, protected
+/// from rename/delete, and dropped again when the rules stop producing them.
+pub fn is_system_tag(name: &str) -> bool {
+    OFFICIAL_AUTO_TAGS
+        .iter()
+        .chain(COMPOSITION_TAGS.iter())
+        .any(|t| t.eq_ignore_ascii_case(name))
 }
 
 fn cloud_drive_re() -> &'static Regex {
@@ -116,9 +135,50 @@ fn api_key_re() -> &'static Regex {
     })
 }
 
+/// Bucket a leftover token by character makeup: all ASCII digits → "纯数字",
+/// all ASCII letters → "纯字母", both present → "数字字母".
+///
+/// Anything else (whitespace, punctuation, hyphens, CJK, symbols) returns None:
+/// the point is a *pure* token, and a mixed blob is better left untagged than
+/// misfiled — prose and UUIDs would otherwise flood these buckets.
+fn classify_composition_tag(trimmed: &str) -> Option<&'static str> {
+    if trimmed.len() > COMPOSITION_MAX_BYTES {
+        return None;
+    }
+
+    let mut chars = 0usize;
+    let mut digits = 0usize;
+    let mut letters = 0usize;
+    for ch in trimmed.chars() {
+        chars += 1;
+        if ch.is_ascii_digit() {
+            digits += 1;
+        } else if ch.is_ascii_alphabetic() {
+            letters += 1;
+        } else {
+            return None;
+        }
+    }
+
+    if chars < COMPOSITION_MIN_CHARS {
+        return None;
+    }
+
+    match (digits > 0, letters > 0) {
+        (true, false) => Some("纯数字"),
+        (false, true) => Some("纯字母"),
+        (true, true) => Some("数字字母"),
+        (false, false) => None,
+    }
+}
+
 /// Inspect clipboard content and return the official tags it should carry:
 /// at most one category tag (by `CATEGORY_PRIORITY`) plus "sensitive".
 /// `content_type` is the entry's detected type ("url", "text", "code", ...).
+///
+/// When no category tag matches, the entry falls back to at most one
+/// composition tag (see `classify_composition_tag`) — the two groups are
+/// disjoint by design.
 pub fn classify_auto_tags(content: &str, content_type: &str) -> Vec<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() || trimmed.starts_with("data:") {
@@ -156,6 +216,10 @@ pub fn classify_auto_tags(content: &str, content_type: &str) -> Vec<String> {
     {
         tags.push(category.to_string());
         tags.push("sensitive".to_string());
+    } else if let Some(composition) = classify_composition_tag(trimmed) {
+        // Unrecognized content: group it by character makeup instead of leaving
+        // it tagless. Not "sensitive" — nothing secret is implied by "纯数字".
+        tags.push(composition.to_string());
     }
     tags
 }
@@ -219,25 +283,68 @@ mod tests {
 
     #[test]
     fn rejects_phone_false_positives() {
+        // Pure digit strings are NOT phones — they may still fall into the
+        // "纯数字" composition bucket, so assert on the phone tag only.
+        let no_phone = |content: &str| {
+            let result = tags(content, "text");
+            assert!(
+                !result.iter().any(|t| t == "手机号"),
+                "unexpected 手机号 for {:?}: {:?}",
+                content,
+                result
+            );
+            result
+        };
         // 港/英裸号不再识别：8 位/10 位数字串误报率过高
-        assert!(tags("61234567", "text").is_empty());
-        assert!(tags("9123-4567", "text").is_empty());
-        assert!(tags("7856215531", "text").is_empty());
-        assert!(tags("7935847389", "text").is_empty());
+        assert!(no_phone("61234567").iter().all(|t| t == "纯数字"));
+        assert!(no_phone("9123-4567").is_empty());
+        assert!(no_phone("7856215531").iter().all(|t| t == "纯数字"));
+        assert!(no_phone("7935847389").iter().all(|t| t == "纯数字"));
         // 10 位 QQ 号、400 热线、12 位座机
-        assert!(tags("2533450096", "text").is_empty());
-        assert!(tags("4001234567", "text").is_empty());
-        assert!(tags("075512345678", "text").is_empty());
-        // UUID 与应用协议串里的数字片段
-        assert!(tags("43712110-1a06-42e0-a44c-a2d65fd9d673", "text").is_empty());
-        assert!(tags("ms-a0de3abd-7c70-4138-9266-1d96bf3d6781", "text").is_empty());
-        assert!(tags(
+        assert!(no_phone("2533450096").iter().all(|t| t == "纯数字"));
+        assert!(no_phone("4001234567").iter().all(|t| t == "纯数字"));
+        assert!(no_phone("075512345678").iter().all(|t| t == "纯数字"));
+        // UUID 与应用协议串里的数字片段（带连字符/空格，不进纯数字桶）
+        assert!(no_phone("43712110-1a06-42e0-a44c-a2d65fd9d673").is_empty());
+        assert!(no_phone("ms-a0de3abd-7c70-4138-9266-1d96bf3d6781").is_empty());
+        assert!(no_phone(
             "start \"\" \"quicker:runaction:43712110-1a06-42e0-a44c-a2d65fd9d673\"\"",
-            "text"
         )
         .is_empty());
-        assert!(tags("61419745", "text").is_empty());
-        assert!(tags("95581594", "text").is_empty());
+        assert!(no_phone("61419745").iter().all(|t| t == "纯数字"));
+        assert!(no_phone("95581594").iter().all(|t| t == "纯数字"));
+    }
+
+    #[test]
+    fn buckets_unrecognized_tokens_by_composition() {
+        // 全数字 / 全字母 / 数字字母交叉：未识别内容的三类分组
+        assert_eq!(tags("61419745", "text"), vec!["纯数字"]);
+        assert_eq!(tags("1024", "text"), vec!["纯数字"]);
+        assert_eq!(tags("abcdef", "text"), vec!["纯字母"]);
+        assert_eq!(tags("HelloWorld", "text"), vec!["纯字母"]);
+        assert_eq!(tags("a1B2c3", "text"), vec!["数字字母"]);
+        assert_eq!(tags("INV20261009X", "text"), vec!["数字字母"]);
+
+        // 组合标签不带 sensitive：它们只分组，不触发加密
+        assert!(!tags("a1B2c3", "text").iter().any(|t| t == "sensitive"));
+
+        // 含空格/标点/中文/短串的都不归桶
+        assert!(tags("hello world", "text").is_empty());
+        assert!(tags("2026-10-09", "text").is_empty());
+        assert!(tags("中文abc", "text").is_empty());
+        assert!(tags("ab", "text").is_empty());
+        assert!(tags("1", "text").is_empty());
+
+        // 分类标签优先，二者互斥
+        assert_eq!(
+            tags("2533450096@qq.com", "text"),
+            vec!["邮箱", "sensitive"]
+        );
+        assert_eq!(tags("19175988337", "text"), vec!["手机号", "sensitive"]);
+        assert_eq!(
+            tags("https://www.example.com/a1B2", "url"),
+            vec!["网站", "sensitive"]
+        );
     }
 
     #[test]
@@ -289,6 +396,12 @@ mod tests {
         assert!(is_official_tag("apikey"));
         assert!(is_official_tag("sensitive"));
         assert!(is_official_tag("密码"));
+        // Composition tags are system-owned too
+        assert!(is_official_tag("纯数字"));
+        assert!(is_official_tag("纯字母"));
+        assert!(is_official_tag("数字字母"));
+        assert!(is_system_tag("纯数字"));
+        assert!(!is_system_tag("sensitive"));
         assert!(!is_official_tag("cd"));
     }
 }

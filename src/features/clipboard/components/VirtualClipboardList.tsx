@@ -45,11 +45,14 @@ const VirtualClipboardList = React.forwardRef<VirtualClipboardListHandle, Virtua
             isKeyboardMode,
             onScroll,
             compactMode,
-            header
+            header,
+            restoreStateFrom,
+            onStateChange
         } = props;
 
         const virtuosoRef = useRef<VirtuosoHandle>(null);
         const visibleRangeRef = useRef<ListRange | null>(null);
+        const restoredSelectionRef = useRef(restoreStateFrom ? { index: selectedIndex, keyboard: isKeyboardMode } : null);
         useImperativeHandle(ref, () => ({
             scrollToItem: (index: number) => {
                 virtuosoRef.current?.scrollIntoView({
@@ -71,6 +74,10 @@ const VirtualClipboardList = React.forwardRef<VirtualClipboardListHandle, Virtua
 
         // Keep keyboard selection visible even when the item is only in overscan
         React.useEffect(() => {
+            // Returning to the same list must not recenter an unchanged selection.
+            const restored = restoredSelectionRef.current;
+            if (restored && restored.index === selectedIndex && restored.keyboard === isKeyboardMode) return;
+            restoredSelectionRef.current = null;
             if (!isKeyboardMode || selectedIndex < 0) return;
 
             const range = visibleRangeRef.current;
@@ -107,7 +114,9 @@ const VirtualClipboardList = React.forwardRef<VirtualClipboardListHandle, Virtua
         // Handle scroll events
         const handleScroll = useCallback((scrollTop: number) => {
             onScroll?.(scrollTop);
-        }, [onScroll]);
+            // Virtuoso's internal scroll state can lag this DOM event by one tick.
+            if (onStateChange) virtuosoRef.current?.getState(snapshot => onStateChange({ ...snapshot, scrollTop }));
+        }, [onScroll, onStateChange]);
 
         // Handle end reached for infinite loading
         const handleEndReached = useCallback(() => {
@@ -145,6 +154,7 @@ const VirtualClipboardList = React.forwardRef<VirtualClipboardListHandle, Virtua
                 <Virtuoso
                     ref={virtuosoRef}
                     data={items}
+                    restoreStateFrom={restoreStateFrom}
                     itemContent={itemContent}
                     components={components}
                     context={context}
