@@ -17,6 +17,33 @@ const CATEGORY_PRIORITY: &[&str] = &["apikey", "手机号", "邮箱", "网盘", 
 /// only group, they do not encrypt.
 pub const COMPOSITION_TAGS: &[&str] = &["纯数字", "纯字母", "数字字母"];
 
+/// Shape tags describe *what kind of text* the entry is, independent of the
+/// category/composition buckets above: a long document and an AI prompt are
+/// identified here so they can be filtered ("tag:长文本") instead of hunted for
+/// by keyword. Like composition tags they only group — they never imply
+/// "sensitive" and never trigger encryption.
+pub const SHAPE_TAGS: &[&str] = &["长文本", "AI提示词"];
+
+/// Content at least this many characters (CJK characters, not bytes) counts as
+/// 长文本. Ordinary clipboard text — a sentence, a token, a path — stays far
+/// below; a paragraph or two already crosses it.
+pub const LONG_TEXT_MIN_CHARS: usize = 200;
+
+/// Shortest content that can be an AI prompt. Below this, "请帮我..." is just
+/// everyday phrasing and tagging it would bury the real prompts.
+const PROMPT_MIN_CHARS: usize = 40;
+
+/// Prompt shape (role, task, output format) is declared at the top, so only the
+/// head of a long document is scanned.
+const PROMPT_SCAN_MAX_CHARS: usize = 4000;
+/// Upper bound for the prompt judgement. A prompt longer than this is a pasted
+/// page or a document, not something someone wrote to hand to a model.
+const PROMPT_MAX_CHARS: usize = 12_000;
+/// A prompt opens with its ask. Answers, docs and articles also use 请/不要
+/// somewhere in the body, so the imperative has to show up in the opening
+/// stretch to count.
+const PROMPT_OPENING_SCAN_CHARS: usize = 200;
+
 const PATTERN_SCAN_MAX_BYTES: usize = 5000;
 
 /// Longer than this is a document, not a token; bucketing prose by character
@@ -37,6 +64,7 @@ pub fn is_system_tag(name: &str) -> bool {
     OFFICIAL_AUTO_TAGS
         .iter()
         .chain(COMPOSITION_TAGS.iter())
+        .chain(SHAPE_TAGS.iter())
         .any(|t| t.eq_ignore_ascii_case(name))
 }
 
@@ -172,6 +200,147 @@ fn classify_composition_tag(trimmed: &str) -> Option<&'static str> {
     }
 }
 
+fn prompt_self_reference_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Wording that only shows up when someone is addressing a model:
+        // a role assignment, or the word "prompt" itself.
+        Regex::new(
+            r"(?ix)(
+                提示词
+              | system\s*prompt
+              | prompt\s*(?:template|模板)
+              | 角色扮演
+              | 你的人设
+              | 你是(?:一|个|位)
+              | 你的(?:任务|角色|身份|目标)
+              | 作为一名
+              | 作为一个
+              | you\s+are\s+(?:a|an|the|my|an?\s+expert)\b
+              | act\s+as\s+(?:a|an|the|my)\b
+            )",
+        )
+        .unwrap()
+    })
+}
+
+fn prompt_instruction_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Imperative phrasing: what someone *asks for*, in Chinese and English.
+        // Deliberately excludes 要求/规则 — those are section labels (structure),
+        // and counting them twice would flag every spec document.
+        Regex::new(
+            r"(?ix)(
+                请(?:你|帮我)?|麻烦(?:你)?|帮我|帮忙|需要你|你将|你现在
+              | 扮演|模拟|假设|生成|撰写|起草|扩写|续写|润色|改写|重写|翻译
+              | 写一(?:篇|份|个|段|条)|总结(?:一下)?|概括|归纳|提炼
+              | 解释(?:一下)?|分析(?:一下)?|列出|列举|输出|返回|给出|整理
+              | 评估|对比|检查|优化|拆解|分点|分条
+              | 不要|别用|必须|务必|注意
+              | \b(?:please|write|summari[sz]e|translate|rewrite|explain|list|output
+                 |return|generate|analys[ei]|respond|reply|do not|don't|must|should
+                 |step[- ]by[- ]step|make sure)\b
+            )",
+        )
+        .unwrap()
+    })
+}
+
+fn prompt_structure_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Layout of a prompt: markdown headings, bullet/numbered lines, and
+        // labelled sections (角色：/ 任务：/ 输出格式：/ Role: / Format: ...).
+        Regex::new(
+            r"(?ixm)(
+                ^\s*\#{1,4}\s
+              | ^\s*[-*•·]\s
+              | ^\s*\d{1,2}[.、)）]\s?
+              | (?:角色|身份|任务|目标|背景|要求|约束|规则|输出格式|格式|示例|例子|步骤|流程|注意事项|风格|语气
+                 |context|role|task|goal|requirement|instruction|constraint|format|example|rule|steps?)
+                \s*[:：]
+            )",
+        )
+        .unwrap()
+    })
+}
+
+/// Share of CJK characters and whitespace: prose has one or the other, while
+/// base64 blobs, hashes and minified JSON have neither.
+fn prose_share(text: &str) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut cjk = 0usize;
+    let mut spaces = 0usize;
+    for ch in text.chars() {
+        total += 1;
+        if ('\u{3400}'..='\u{9fff}').contains(&ch) || ('\u{f900}'..='\u{faff}').contains(&ch) {
+            cjk += 1;
+        } else if ch.is_whitespace() {
+            spaces += 1;
+        }
+    }
+    if total == 0 {
+        return (0, 0);
+    }
+    (cjk * 100 / total, spaces * 100 / total)
+}
+
+/// Long *text*: enough characters that the entry is a document rather than a
+/// one-liner, and written as prose rather than a single opaque token.
+fn is_long_text(trimmed: &str, content_type: &str) -> bool {
+    if !matches!(content_type, "text" | "rich_text" | "code") {
+        return false;
+    }
+    if trimmed.chars().count() < LONG_TEXT_MIN_CHARS {
+        return false;
+    }
+    let (cjk, spaces) = prose_share(trimmed);
+    cjk >= 4 || spaces >= 8
+}
+
+/// Heuristic: does this read like a prompt written *for* a model?
+///
+/// Precision beats recall here — a wrong "AI提示词" on every requirements doc
+/// makes the filter useless — so a single polite word is never enough: the text
+/// needs a role assignment, or an ask in its opening stretch followed by several
+/// imperative verbs, or imperative verbs plus the section/bullet layout that
+/// prompts tend to have. Answers and docs say 请/不要 halfway down the page.
+fn looks_like_ai_prompt(trimmed: &str, content_type: &str) -> bool {
+    if !matches!(content_type, "text" | "rich_text") {
+        return false;
+    }
+    let total = trimmed.chars().count();
+    if !(PROMPT_MIN_CHARS..=PROMPT_MAX_CHARS).contains(&total) {
+        return false;
+    }
+    let sample: String = trimmed.chars().take(PROMPT_SCAN_MAX_CHARS).collect();
+    if prompt_self_reference_re().is_match(&sample) {
+        return true;
+    }
+    let opening: String = sample.chars().take(PROMPT_OPENING_SCAN_CHARS).collect();
+    if !prompt_instruction_re().is_match(&opening) {
+        return false;
+    }
+    let instructions = prompt_instruction_re().find_iter(&sample).count();
+    if instructions == 0 {
+        return false;
+    }
+    let structure = prompt_structure_re().find_iter(&sample).count();
+    instructions >= 4 || (instructions >= 2 && structure >= 1) || (instructions >= 1 && structure >= 2)
+}
+
+fn shape_tags(trimmed: &str, content_type: &str) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if is_long_text(trimmed, content_type) {
+        tags.push("长文本");
+    }
+    if looks_like_ai_prompt(trimmed, content_type) {
+        tags.push("AI提示词");
+    }
+    tags
+}
+
 /// Inspect clipboard content and return the official tags it should carry:
 /// at most one category tag (by `CATEGORY_PRIORITY`) plus "sensitive".
 /// `content_type` is the entry's detected type ("url", "text", "code", ...).
@@ -179,6 +348,9 @@ fn classify_composition_tag(trimmed: &str) -> Option<&'static str> {
 /// When no category tag matches, the entry falls back to at most one
 /// composition tag (see `classify_composition_tag`) — the two groups are
 /// disjoint by design.
+///
+/// Shape tags ("长文本" / "AI提示词", see `SHAPE_TAGS`) are independent of those
+/// buckets and stack on top of them.
 pub fn classify_auto_tags(content: &str, content_type: &str) -> Vec<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() || trimmed.starts_with("data:") {
@@ -220,6 +392,15 @@ pub fn classify_auto_tags(content: &str, content_type: &str) -> Vec<String> {
         // Unrecognized content: group it by character makeup instead of leaving
         // it tagless. Not "sensitive" — nothing secret is implied by "纯数字".
         tags.push(composition.to_string());
+    }
+
+    // Shape tags stack on top of the bucket above: a long document can also read
+    // like a prompt, and a long document that happens to contain a phone number
+    // keeps its category tag too. Still never "sensitive" by itself.
+    for shape in shape_tags(trimmed, content_type) {
+        if !tags.iter().any(|existing| existing == shape) {
+            tags.push(shape.to_string());
+        }
     }
     tags
 }
@@ -391,6 +572,62 @@ mod tests {
     }
 
     #[test]
+    fn tags_long_prose_as_long_text() {
+        let para = "今天下午把剪贴板历史从头翻了一遍，重复的内容比预想的多得多，\n".repeat(10);
+        let result = tags(&para, "text");
+        assert!(result.contains(&"长文本".to_string()), "{:?}", result);
+        // 只分组，不加密
+        assert!(!result.iter().any(|t| t == "sensitive"));
+
+        // 长但不是文本：base64/哈希这类密串、超长 URL 都不算长文本
+        let blob = "aGVsbG8xMjM0NTY3ODkw".repeat(30);
+        assert!(!tags(&blob, "text").iter().any(|t| t == "长文本"));
+        let url = format!("https://example.com/{}", "a".repeat(300));
+        assert!(!tags(&url, "url").iter().any(|t| t == "长文本"));
+
+        // 不到 200 字的普通句子不进这个桶
+        assert!(tags("hello world", "text").is_empty());
+    }
+
+    #[test]
+    fn detects_ai_prompts() {
+        // 角色设定：自指直接命中
+        let role_prompt = "你是一名资深前端工程师。\n\n请审查下面的 React 组件，只指出会导致线上问题的地方。\n\n要求：\n- 按严重程度排序\n- 每条给出修改后的代码\n\n输出格式：Markdown 表格。";
+        assert!(tags(role_prompt, "text").contains(&"AI提示词".to_string()));
+
+        // 没有角色设定，但指令密集
+        let task_prompt = "请帮我写一份本周的工作周报，总结本周完成的需求和进展，列出遇到的风险点，给出下周计划，语气正式一些，不要用第一人称。";
+        assert!(tags(task_prompt, "text").contains(&"AI提示词".to_string()));
+
+        // 说明文/回答式内容：指令词只出现在中后段，开头没有"请求"，不算提示词
+        let filler = "这段内容用于占位，不包含任何指令。".repeat(12);
+        let late_ask = format!("{}\n请帮我总结并列出要点，不要遗漏，必须给出结论。", filler);
+        assert!(late_ask.chars().count() > 200);
+        assert!(
+            !tags(&late_ask, "text").iter().any(|t| t == "AI提示词"),
+            "{:?}",
+            tags(&late_ask, "text")
+        );
+
+        // 日常邮件/说明不是提示词
+        let mail = "麻烦你确认一下附件里的金额是否正确，另外把上周的数据重新整理一遍，我们明天开会要用，谢谢。";
+        assert!(!tags(mail, "text").iter().any(|t| t == "AI提示词"), "{:?}", tags(mail, "text"));
+
+        let notes = "会议纪要：今天讨论了三件事，第一是排期，第二是人力，第三是上线时间。\n".repeat(4);
+        assert!(!tags(&notes, "text").iter().any(|t| t == "AI提示词"));
+
+        // 整页粘贴（论坛/文档）远超提示词长度上限，指令再密也不算
+        let page_dump = "请帮我整理这段内容，列成要点，不要遗漏。\n".repeat(700);
+        assert!(page_dump.chars().count() > 12_000);
+        assert!(!tags(&page_dump, "text").iter().any(|t| t == "AI提示词"));
+
+        // 代码不参与提示词判定
+        let code = "请帮我写一份周报，总结本周进展，列出风险，给出下周计划，不要用第一人称。\n".repeat(3);
+        assert!(tags(&code, "text").contains(&"AI提示词".to_string()));
+        assert!(!tags(&code, "code").iter().any(|t| t == "AI提示词"));
+    }
+
+    #[test]
     fn official_tag_detection() {
         assert!(is_official_tag("网站"));
         assert!(is_official_tag("apikey"));
@@ -401,6 +638,11 @@ mod tests {
         assert!(is_official_tag("纯字母"));
         assert!(is_official_tag("数字字母"));
         assert!(is_system_tag("纯数字"));
+        // Shape tags are system-owned too: seeded, protected, and re-derived
+        assert!(is_official_tag("长文本"));
+        assert!(is_official_tag("AI提示词"));
+        assert!(is_system_tag("长文本"));
+        assert!(is_system_tag("AI提示词"));
         assert!(!is_system_tag("sensitive"));
         assert!(!is_official_tag("cd"));
     }

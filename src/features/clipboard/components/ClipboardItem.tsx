@@ -27,7 +27,8 @@ import {
     Files,
     ImageOff,
     FileQuestion,
-    GripVertical
+    GripVertical,
+    StickyNote
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { ClipboardItemProps } from "../types";
@@ -46,6 +47,10 @@ import { registerCompactPreviewControls } from "../lib/compactPreviewControls";
 import { debugLog, isDebugLogging } from "../../../shared/lib/debug";
 
 const COMPACT_PREVIEW_LABEL = "compact-preview";
+// 拖拽导出：按下后移动超过这个距离才算「拖」，否则当成一次普通点击（粘贴）。
+// 取 6px 而不是系统默认的 SM_CXDRAG(4px)：手抖 4-5px 很常见，误判成拖拽会直接吞掉粘贴，
+// 而真正要拖到文件夹的人早就移动了几十上百像素，多 2px 门槛不影响手感。
+const DRAG_OUT_THRESHOLD_PX = 6;
 const RICH_IMAGE_FALLBACK_PREFIX = "<!--TIEZ_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX = "-->";
 const TABULAR_RICH_HTML_RE = /<(table|tr|td|th|thead|tbody|tfoot|colgroup|col)\b/i;
@@ -722,6 +727,14 @@ const ClipboardItem = ({
 }: ClipboardItemProps & { compactMode?: boolean, className?: string }) => {
     const itemRef = useRef<HTMLDivElement | null>(null);
     const tagInputRef = useRef<HTMLInputElement>(null);
+    // 拖拽导出：mousedown 之后、拖拽成型之前挂着的全局监听器，留一个清理入口。
+    // 窗口在这一小段时间里被隐藏或失焦时 mouseup 收不到，监听会残留到下一次鼠标操作，
+    // 把无关的按住移动（拖滚动条、拖选文字）误判成「拖出这个条目」。
+    const pendingDragOutCleanupRef = useRef<(() => void) | null>(null);
+    useEffect(() => () => {
+        pendingDragOutCleanupRef.current?.();
+        pendingDragOutCleanupRef.current = null;
+    }, []);
     const [localTagInput, setLocalTagInput] = useState(tagInput);
     const [localAiOptionsOpen, setLocalAiOptionsOpen] = useState(!!aiOptionsOpen);
     const [snapshotFailed, setSnapshotFailed] = useState(false);
@@ -761,6 +774,28 @@ const ClipboardItem = ({
 
     const [tagSuggestIndex, setTagSuggestIndex] = useState(-1);
     const tagSuggestListRef = useRef<HTMLDivElement | null>(null);
+
+    // 备注（note 列）：自由文本注释。
+    // 编辑态、草稿、已保存值三份分开存 —— noteLocal 是保存成功后的乐观副本，
+    // 父级数组里的 item.note 要等 clipboard-changed 重新拉数据才更新，
+    // 只看 item.note 的话刚写完会闪回旧值。
+    const [noteOpen, setNoteOpen] = useState(false);
+    const [noteDraft, setNoteDraft] = useState("");
+    const [noteLocal, setNoteLocal] = useState<string | null>(null);
+    const [noteSaving, setNoteSaving] = useState(false);
+    const noteEditorRef = useRef<HTMLDivElement | null>(null);
+    const noteBlurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const noteValue = noteLocal ?? item.note ?? "";
+
+    useEffect(() => () => {
+        if (noteBlurTimerRef.current) clearTimeout(noteBlurTimerRef.current);
+    }, []);
+
+    // 后端把新值带回来（clipboard-changed → 重新拉列表）之后，乐观副本就过期了，
+    // 交回给 item.note，避免本地留着旧值跟服务端打架。
+    useEffect(() => {
+        setNoteLocal(null);
+    }, [item.note]);
 
     useEffect(() => {
         if (!isEditingTags) setTagSuggestIndex(-1);
@@ -982,6 +1017,43 @@ const ClipboardItem = ({
     const hideCompactPreview = async () => {
         cancelHoverPreview();
         await hideCompactPreviewGlobal();
+    };
+
+    // ---- 备注（note 列）-----------------------------------------------------
+    const clearNoteBlurTimer = () => {
+        if (noteBlurTimerRef.current) {
+            clearTimeout(noteBlurTimerRef.current);
+            noteBlurTimerRef.current = null;
+        }
+    };
+
+    const saveNote = async (value: string) => {
+        const trimmed = value.trim();
+        clearNoteBlurTimer();
+        setNoteSaving(true);
+        try {
+            await invoke("update_entry_note", { id: item.id, note: trimmed });
+            setNoteLocal(trimmed);
+            setNoteDraft(trimmed);
+            setNoteOpen(false);
+        } catch (err) {
+            console.error("[Note] save failed", err);
+        } finally {
+            setNoteSaving(false);
+        }
+    };
+
+    const openNoteEditor = () => {
+        clearNoteBlurTimer();
+        void hideCompactPreview();
+        setNoteDraft(noteValue);
+        setNoteOpen(true);
+    };
+
+    const closeNoteEditor = () => {
+        clearNoteBlurTimer();
+        setNoteDraft(noteValue);
+        setNoteOpen(false);
     };
 
     const showCompactPreview = async (anchor: CompactPreviewAnchor, requestId: number) => {
@@ -1508,14 +1580,70 @@ const ClipboardItem = ({
                 const target = e.target as HTMLElement;
                 if (e.button !== 0) return;
 
-                // 拖拽导出模式：按住条目就把内容落成文件交给 OLE，不做复制。
+                // 拖拽导出模式：单击照常粘贴，只有「按住并移动超过阈值」才把内容落成文件交给 OLE。
                 if (dragOutEnabled && !isEditingTags) {
                     if (target.closest('button, input, textarea, [role="button"], .drag-handle')) return;
                     if (target.closest('a')) return;
                     e.preventDefault();
                     e.stopPropagation();
+                    // 悬停预览先收起来，免得按下去到拖起来之间它挂在旁边。
                     void hideCompactPreview();
-                    onStartDragOut?.(item);
+
+                    const startX = e.clientX;
+                    const startY = e.clientY;
+                    let dragStarted = false;
+
+                    // 上一次按下的手势万一没收干净（窗口被隐藏，mouseup 丢了），先收掉再挂新的。
+                    pendingDragOutCleanupRef.current?.();
+
+                    const cleanup = () => {
+                        window.removeEventListener("mousemove", handleMove, true);
+                        window.removeEventListener("mouseup", handleUp, true);
+                        window.removeEventListener("blur", handleLostFocus);
+                        document.removeEventListener("visibilitychange", handleVisibilityChange);
+                        if (pendingDragOutCleanupRef.current === cleanup) {
+                            pendingDragOutCleanupRef.current = null;
+                        }
+                    };
+
+                    function handleMove(ev: MouseEvent) {
+                        if (dragStarted) return;
+                        // 按键已经松开（mouseup 没收到，比如被别的窗口吃掉）：当作没拖，免得后续移动误触发拖拽。
+                        if (ev.buttons === 0) {
+                            cleanup();
+                            return;
+                        }
+                        const dx = ev.clientX - startX;
+                        const dy = ev.clientY - startY;
+                        if (dx * dx + dy * dy < DRAG_OUT_THRESHOLD_PX * DRAG_OUT_THRESHOLD_PX) return;
+                        dragStarted = true;
+                        cleanup();
+                        onStartDragOut?.(item);
+                    }
+
+                    function handleUp() {
+                        cleanup();
+                        // 已经进入 OLE 拖拽循环，mouseup 会被它吃掉，这里不会再做事。
+                        if (dragStarted) return;
+                        onCopy(false); // 纯文本，和普通点击一致
+                        onSelect();
+                    }
+
+                    // 窗口在这一刻被收起/失焦（失焦即隐藏、全局热键、托盘菜单）：手势作废，
+                    // 既不能等 mouseup（不会来了），也不能留着监听器。
+                    function handleLostFocus() {
+                        cleanup();
+                    }
+
+                    function handleVisibilityChange() {
+                        if (document.visibilityState === "hidden") cleanup();
+                    }
+
+                    pendingDragOutCleanupRef.current = cleanup;
+                    window.addEventListener("mousemove", handleMove, true);
+                    window.addEventListener("mouseup", handleUp, true);
+                    window.addEventListener("blur", handleLostFocus);
+                    document.addEventListener("visibilitychange", handleVisibilityChange);
                     return;
                 }
 
@@ -1684,6 +1812,17 @@ const ClipboardItem = ({
                             title="Tags"
                         >
                             <Tag size={12} />
+                        </button>
+                        <button
+                            className={`btn-icon ${noteValue ? "active" : ""}`}
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                if (noteOpen) closeNoteEditor();
+                                else openNoteEditor();
+                            }}
+                            title={t('note')}
+                        >
+                            <StickyNote size={12} />
                         </button>
                         {(item.content_type === 'text' || item.content_type === 'rich_text') && aiEnabled && (
                             <button
@@ -1910,6 +2049,109 @@ const ClipboardItem = ({
                 </div>
             </div>
 
+            {/* 备注：收起时是内容下方的一行小字，点开是带下划线的编辑区。
+                两者都不让它冒泡到条目上——点备注不能顺手触发「复制并粘贴」。 */}
+            <AnimatePresence initial={false}>
+                {!noteOpen && noteValue && (
+                    <motion.div
+                        key="note-view"
+                        className="item-note"
+                        initial={{ opacity: 0, y: -3 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -3 }}
+                        transition={{ duration: 0.16, ease: 'easeOut' }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            openNoteEditor();
+                        }}
+                        onContextMenu={(e) => e.stopPropagation()}
+                        title={noteValue}
+                    >
+                        <StickyNote size={11} className="item-note-icon" />
+                        <span className="item-note-text">{noteValue}</span>
+                    </motion.div>
+                )}
+
+                {noteOpen && (
+                    <motion.div
+                        key="note-editor"
+                        ref={noteEditorRef}
+                        className="item-note-editor"
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ height: { duration: 0.2, ease: [0.22, 1, 0.36, 1] }, opacity: { duration: 0.14 } }}
+                        style={{ overflow: 'hidden' }}
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onClick={(e) => e.stopPropagation()}
+                        onContextMenu={(e) => e.stopPropagation()}
+                    >
+                        <textarea
+                            className="item-note-input"
+                            rows={3}
+                            autoFocus
+                            value={noteDraft}
+                            placeholder={t('note_placeholder')}
+                            onChange={(e) => setNoteDraft(e.target.value)}
+                            onFocus={() => {
+                                invoke('activate_window_focus').catch(() => { });
+                            }}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Escape') {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    closeNoteEditor();
+                                    return;
+                                }
+                                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                                    e.preventDefault();
+                                    void saveNote(noteDraft);
+                                }
+                            }}
+                            onBlur={() => {
+                                // 点「保存 / 取消」也会先触发 blur，所以晚一拍再判断焦点：
+                                // 焦点还在编辑器里就什么都不做，真离开了就静默保存（没改动则收起）。
+                                clearNoteBlurTimer();
+                                noteBlurTimerRef.current = setTimeout(() => {
+                                    noteBlurTimerRef.current = null;
+                                    if (!noteEditorRef.current) return; // 已经关闭
+                                    const active = document.activeElement;
+                                    if (active && noteEditorRef.current.contains(active)) return;
+                                    const trimmed = noteDraft.trim();
+                                    if (trimmed !== noteValue) void saveNote(trimmed);
+                                    else setNoteOpen(false);
+                                }, 140);
+                            }}
+                        />
+                        <div className="item-note-footer">
+                            <span className="item-note-hint">{t('note_hint')}</span>
+                            <div className="item-note-actions">
+                                <button
+                                    className="note-btn"
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        closeNoteEditor();
+                                    }}
+                                >
+                                    {t('note_cancel')}
+                                </button>
+                                <button
+                                    className="note-btn primary"
+                                    disabled={noteSaving}
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        void saveNote(noteDraft);
+                                    }}
+                                >
+                                    {noteSaving ? <Loader2 size={11} className="animate-spin" /> : t('note_save')}
+                                </button>
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
             {/* AI Options - Compact Mode: Dropdown Panel, Normal Mode: Inline */}
             <AnimatePresence>
                 {showAIOptions && (
@@ -2005,6 +2247,7 @@ export default memo(ClipboardItem, (prevProps, nextProps) => {
         prevProps.item.is_external === nextProps.item.is_external &&
         prevProps.item.file_preview_exists === nextProps.item.file_preview_exists &&
         prevProps.item.tags === nextProps.item.tags &&
+        prevProps.item.note === nextProps.item.note &&
         prevProps.isSensitiveHidden === nextProps.isSensitiveHidden &&
         prevProps.tagColors === nextProps.tagColors &&
         prevProps.sensitiveMaskPrefixVisible === nextProps.sensitiveMaskPrefixVisible &&

@@ -1,4 +1,4 @@
-import React, { useRef, useImperativeHandle, useCallback, useMemo } from 'react';
+import React, { useRef, useImperativeHandle, useCallback, useMemo, useState } from 'react';
 import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import type { ListRange } from 'react-virtuoso';
 import type { ClipboardEntry } from "../../../shared/types";
@@ -8,6 +8,9 @@ type VirtuosoListContext = {
     header?: React.ReactNode;
     hasMore: boolean;
     isLoading: boolean;
+    /** False for the first couple of frames after mount: a list that is still
+     * measuring its rows would otherwise flash its footer into view. */
+    ready: boolean;
 };
 
 const ListHeader = ({ context }: { context?: VirtuosoListContext }) => {
@@ -17,7 +20,8 @@ const ListHeader = ({ context }: { context?: VirtuosoListContext }) => {
 
 const ListFooter = ({ context }: { context?: VirtuosoListContext }) => {
     if (!context) return null;
-    const { isLoading, hasMore } = context;
+    const { isLoading, hasMore, ready } = context;
+    if (!ready) return null;
     if (!isLoading && !hasMore) return null;
 
     return (
@@ -51,6 +55,20 @@ const VirtualClipboardList = React.forwardRef<VirtualClipboardListHandle, Virtua
         } = props;
 
         const virtuosoRef = useRef<VirtuosoHandle>(null);
+        // A freshly mounted list measures row heights over the next frames; until
+        // then the footer sits inside the viewport. Keep it hidden so switching a
+        // filter or a layout width never flashes "加载更多…".
+        const [footerReady, setFooterReady] = useState(false);
+        React.useEffect(() => {
+            let second = 0;
+            const first = requestAnimationFrame(() => {
+                second = requestAnimationFrame(() => setFooterReady(true));
+            });
+            return () => {
+                cancelAnimationFrame(first);
+                cancelAnimationFrame(second);
+            };
+        }, []);
         const visibleRangeRef = useRef<ListRange | null>(null);
         const restoredSelectionRef = useRef(restoreStateFrom ? { index: selectedIndex, keyboard: isKeyboardMode } : null);
         useImperativeHandle(ref, () => ({
@@ -146,8 +164,9 @@ const VirtualClipboardList = React.forwardRef<VirtualClipboardListHandle, Virtua
         const context = useMemo(() => ({
             header,
             hasMore,
-            isLoading
-        }), [header, hasMore, isLoading]);
+            isLoading,
+            ready: footerReady
+        }), [header, hasMore, isLoading, footerReady]);
 
         return (
             <div className="virtual-list-wrapper" style={{ height: '100%', width: '100%' }}>

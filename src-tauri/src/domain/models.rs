@@ -23,6 +23,8 @@ pub struct ClipboardEntry {
     pub pinned_order: i64, // For manual sorting of pinned items
     #[serde(default = "default_true")]
     pub file_preview_exists: bool, // Transient field: does the file exist on disk?
+    #[serde(default)]
+    pub note: String, // User annotation; "" when none. Plain text, never encrypted.
 }
 
 fn default_true() -> bool {

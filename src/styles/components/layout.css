@@ -1,4 +1,7 @@
 header {
+  /* 工具条可以停在列表上方，头部这一层得压得住内容区 */
+  position: relative;
+  z-index: 20;
   padding: 6px 0;
   background: var(--bg-toolbar);
   border-bottom: var(--toolbar-border);
@@ -69,10 +72,122 @@ header {
   white-space: nowrap;
 }
 
+/* 右上角工具条：留在文档流里（头部高度不跳），只用 transform 飘出去。
+   松手时的磁吸 / 复位靠这里的 transition 兜住，拖动中由 .is-dragging 关掉。 */
 .header-actions {
+  position: relative;
+  z-index: 40;
+  flex: 0 0 auto;
+  touch-action: none;
+  cursor: grab;
+  will-change: transform;
+  transition: transform 0.46s cubic-bezier(0.16, 1.14, 0.3, 1);
+}
+
+.header-actions.is-dragging {
+  z-index: 80;
+  cursor: grabbing;
+  transition: none;
+}
+
+.header-actions-inner {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 4px;
+  padding: 2px;
+  margin: -2px;
+  border-radius: 10px;
+  transform-origin: 50% 50%;
+  transition:
+    transform 0.44s cubic-bezier(0.16, 1.2, 0.3, 1),
+    background-color 0.22s ease,
+    box-shadow 0.22s ease,
+    backdrop-filter 0.22s ease;
+}
+
+/* 拖动过程中倾斜要跟手：短线性过渡，松手才换回上面的回弹曲线 */
+.header-actions.is-dragging .header-actions-inner {
+  transition:
+    transform 0.11s linear,
+    background-color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.header-actions-grip {
+  /* 真把手：悬停时点亮，按住拖，双击复位 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 22px;
+  flex: 0 0 13px;
+  border-radius: 3px;
+  cursor: grab;
+  background-image: radial-gradient(circle, currentColor 1px, transparent 1.1px);
+  background-size: 3px 5px;
+  background-position: center;
+  background-repeat: repeat-y;
+  color: var(--text-muted);
+  opacity: 0.28;
+  transition: opacity 0.18s ease, color 0.18s ease;
+}
+
+.header-actions:hover .header-actions-grip {
+  opacity: 0.55;
+}
+
+.header-actions.is-dragging .header-actions-grip {
+  opacity: 0.8;
+  color: var(--accent-color);
+  cursor: grabbing;
+}
+
+.header-actions .btn-icon {
+  cursor: pointer;
+}
+
+.header-actions.is-dragging .header-actions-inner {
+  background: var(--bg-element);
+  box-shadow: var(--shadow-lg, 0 18px 36px rgba(15, 23, 42, 0.26));
+  backdrop-filter: blur(12px) saturate(160%);
+  -webkit-backdrop-filter: blur(12px) saturate(160%);
+}
+
+.header-actions.is-dragging .btn-icon {
+  box-shadow: none;
+}
+
+/* 落位那一圈呼吸光环：说明「它停在这了」，只在松手后 0.5s 内出现 */
+.header-actions-inner::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 12px;
+  border: 1.5px solid var(--accent-color);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.header-actions.is-settling .header-actions-inner::after {
+  animation: header-actions-ring 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes header-actions-ring {
+  0% {
+    opacity: 0.5;
+    transform: scale(0.9);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.12);
+  }
+}
+
+body.toolbar-dragging,
+body.toolbar-dragging * {
+  cursor: grabbing !important;
+  user-select: none !important;
 }
 
 .header-actions .btn-icon,
@@ -277,3 +392,4 @@ select.search-input option {
   background: var(--card-selected-background);
   transform: scale(1.01);
 }
+

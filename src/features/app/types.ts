@@ -42,8 +42,6 @@ export interface AppState {
   setIsComposing: StateSetter<boolean>;
   searchIsFocused: boolean;
   setSearchIsFocused: StateSetter<boolean>;
-  showTagFilter: boolean;
-  setShowTagFilter: StateSetter<boolean>;
   tagInput: string;
   setTagInput: StateSetter<string>;
   showEmojiPanel: boolean;

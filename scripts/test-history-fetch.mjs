@@ -213,3 +213,39 @@ console.log('PASS: loading/error/retry states, no automatic retry loop, capped-r
   assert.equal(h.state.request.phase, 'ready');
 }
 console.log('PASS: type-filter IPC casing and retry with exhausted pagination');
+
+for (const query of ['', 'report', 'tag:Work']) {
+  const h = harness(query, { pageSize: 37, fileExtensions: ['pdf', 'docx'] });
+  const dataset = Array.from({length: 261}, (_, i) => ({ ...entry(i + 1), content_type: 'file', content: `report-${i}.pdf` }));
+  let pending = h.api.fetchHistory(true), pages = 0;
+  while (true) {
+    const request = h.requests.at(-1);
+    assert.equal(request.command, 'search_clipboard_history');
+    assert.deepEqual(Array.from(request.args.fileExtensions), ['pdf', 'docx']);
+    assert.equal(request.args.offset, pages * 37);
+    assert.equal(request.args.limit, 38);
+    request.resolve(dataset.slice(request.args.offset, request.args.offset + request.args.limit));
+    await pending;
+    pages++;
+    if (!h.state.more) break;
+    assert.ok(pages < 20);
+    pending = h.api.loadMoreHistory();
+  }
+  assert.equal(h.state.history.length, 261);
+  assert.equal(h.state.offset, 261);
+  assert.equal(h.state.request.limited, false);
+}
+{
+  const h = harness('report', {fileExtensions:['pdf']});
+  let pending = h.api.fetchHistory(true);
+  h.requests.at(-1).resolve([entry(0), entry(0), entry(2)]); await pending;
+  assert.equal(h.state.offset, 2);
+  pending = h.api.loadMoreHistory();
+  assert.equal(h.requests.at(-1).args.offset, 2);
+  h.requests.at(-1).reject(new Error('temporary')); await pending;
+  pending = h.api.retryHistory();
+  assert.equal(h.requests.at(-1).args.offset, 2);
+  h.requests.at(-1).resolve([entry(4)]); await pending;
+  assert.equal(h.state.request.phase, 'ready');
+}
+console.log('PASS: 261 file-format results with keyword/tag filters, lookahead, transient offsets and page retry');

@@ -342,6 +342,43 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
     }
 
+    // Migration 16: Shape tags (长文本 / AI提示词) for identifying and filtering
+    // long text — AI prompts in particular. Classification only, never "sensitive":
+    // these tags group entries, they do not encrypt them. Entries saved before
+    // this version are tagged by the one-off realignment pass (see
+    // `services::auto_tag_align`), which only runs once per flag, hence the
+    // version bump of that flag alongside this migration.
+    if current_version < 16 {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS saved_tags (
+                name TEXT PRIMARY KEY,
+                color TEXT
+            )",
+            [],
+        )?;
+        for tag in crate::services::auto_tag::SHAPE_TAGS {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO saved_tags (name) VALUES (?1)",
+                params![tag],
+            )?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (16)", [])?;
+    }
+
+    // Migration 17: Per-entry note (annotation).
+    // A free-form remark the user attaches to one history entry — the annotation
+    // editor in the item card writes it. Empty string means "no note", never NULL,
+    // so the Rust side can use a plain `String` and older rows read as "".
+    if current_version < 17 {
+        if !has_column(conn, "clipboard_history", "note")? {
+            conn.execute(
+                "ALTER TABLE clipboard_history ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (17)", [])?;
+    }
+
     Ok(())
 }
 

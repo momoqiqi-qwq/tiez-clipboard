@@ -111,6 +111,7 @@ pub fn search_clipboard_history(
     tag_only: Option<bool>,
     offset: Option<usize>,
     content_type: Option<String>,
+    file_extensions: Option<Vec<String>>,
 ) -> AppResult<Vec<ClipboardEntry>> {
     let is_tag_only = tag_only.unwrap_or(false);
     if limit <= 0 {
@@ -119,7 +120,9 @@ pub fn search_clipboard_history(
     let session_items = session.inner().0.lock()
         .map_err(|e| AppError::from(e.to_string()))?
         .iter().cloned().collect::<Vec<_>>();
-    let mut history = if is_tag_only {
+    let mut history = if let Some(extensions) = file_extensions.filter(|value| !value.is_empty()) {
+        state.repo.search_file_page(&search_term, is_tag_only, &extensions, limit as usize, offset.unwrap_or(0), &session_items)?
+    } else if is_tag_only {
         state.repo.search_tag_page(
             &search_term, limit as usize, offset.unwrap_or(0),
             content_type.as_deref(), &session_items,

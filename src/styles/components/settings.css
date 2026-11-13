@@ -439,7 +439,7 @@
 
 .advanced-workbench {
   display: grid;
-  grid-template-columns: var(--advanced-sidebar-width, 120px) 4px minmax(0, 1fr);
+  grid-template-columns: var(--advanced-sidebar-width, 150px) 4px minmax(0, 1fr);
   grid-template-rows: 1fr !important;
   flex: 1 !important;
   min-height: 0 !important;
@@ -669,6 +669,10 @@
   background: rgba(var(--accent-color-rgb), 0.08);
 }
 
+.advanced-divider:hover {
+  background: rgba(var(--accent-color-rgb), 0.035);
+}
+
 .advanced-divider.active::before,
 .advanced-divider:hover::before {
   background: rgba(var(--accent-color-rgb), 0.2);
@@ -682,7 +686,16 @@
   height: 36px;
   transform: translate(-50%, -50%);
   border-radius: 999px;
-  background: rgba(var(--accent-color-rgb), 0.35);
+  background: rgba(var(--accent-color-rgb), 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+}
+
+/* The handle is a hint, not furniture: it appears only while the grip is in play. */
+.advanced-divider:hover .advanced-divider-handle,
+.advanced-divider.active .advanced-divider-handle {
+  opacity: 1;
 }
 
 .advanced-editor {
@@ -700,21 +713,35 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: nowrap;
   gap: 12px;
-  padding: 18px 24px 12px;
+  padding: 14px 24px 12px;
   border-bottom: 1px solid var(--panel-divider-color);
+}
+
+.advanced-editor-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .advanced-editor-title {
   font-size: 14px;
   font-weight: 700;
   color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .advanced-editor-subtitle {
-  margin-top: 4px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-secondary);
+}
+
+.advanced-add-rule-btn {
+  flex-shrink: 0;
 }
 
 .advanced-rule-list {
@@ -867,49 +894,296 @@
   font-weight: 600;
 }
 
-@media (max-width: 340px) {
-  .advanced-workbench {
-    grid-template-columns: 1fr !important;
-    grid-template-rows: var(--advanced-sidebar-height, 180px) 4px minmax(0, 1fr) !important;
-  }
+/* --- Per-source recording switch --- */
+.advanced-action-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 24px 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(var(--accent-color-rgb), 0.1);
+  background: rgba(var(--bg-panel-rgb), 0.42);
+}
 
-  .advanced-sidebar {
-    height: var(--advanced-sidebar-height, 180px) !important;
-    border-bottom: 1px solid var(--panel-divider-color);
-    border-right: none;
-  }
+.advanced-action-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
 
-  .advanced-divider {
-    display: block;
-    cursor: row-resize;
-  }
+.advanced-action-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
 
-  .advanced-divider::before {
-    left: 0;
-    right: 0;
-    top: 50%;
-    bottom: auto;
-    width: auto;
-    height: 1px;
-    transform: translateY(-50%);
-  }
+.advanced-action-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
 
-  .advanced-divider-handle {
-    left: 50%;
-    top: 50%;
-    width: 36px;
-    height: 3px;
-    transform: translate(-50%, -50%);
-  }
+.advanced-action-switch {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 4px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
 
-  .advanced-target-list {
-    max-height: none;
-  }
+.advanced-action-switch:hover {
+  background: rgba(var(--accent-color-rgb), 0.06);
+}
 
-  .advanced-editor-toolbar {
-    flex-direction: column;
-    align-items: stretch;
-  }
+.advanced-action-switch-track {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: var(--switch-track-radius);
+  background: var(--switch-track-background);
+  border: var(--switch-track-border);
+  box-shadow: var(--switch-track-shadow);
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.advanced-action-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--switch-thumb-background);
+  border: var(--switch-thumb-border);
+  box-shadow: var(--switch-thumb-shadow);
+  transition: transform 0.22s cubic-bezier(0.34, 1.35, 0.5, 1);
+}
+
+.advanced-action-switch.active .advanced-action-switch-track {
+  background: var(--switch-track-active-background);
+  border-color: var(--switch-track-active-border-color);
+}
+
+.advanced-action-switch.active .advanced-action-switch-thumb {
+  transform: translateX(18px);
+}
+
+.advanced-action-switch-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  min-width: 24px;
+  text-align: left;
+}
+
+.advanced-action-switch.active .advanced-action-switch-label {
+  color: var(--text-primary);
+}
+
+/* --- "After match" segmented control --- */
+.advanced-rule-action-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid rgba(var(--accent-color-rgb), 0.08);
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.advanced-rule-action-tab {
+  flex: 1;
+  min-height: 30px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.advanced-rule-action-tab:hover {
+  color: var(--text-primary);
+  background: rgba(var(--accent-color-rgb), 0.06);
+}
+
+.advanced-rule-action-tab.active {
+  color: var(--text-primary);
+  background: rgba(var(--accent-color-rgb), 0.2);
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-color-rgb), 0.32);
+}
+
+.advanced-rule-action-tab.active:hover {
+  background: rgba(var(--accent-color-rgb), 0.26);
+}
+
+/* Empty state should sit where the rules will appear, not float at the top. */
+.advanced-rule-list:has(> .advanced-empty-state:only-child) {
+  justify-content: center;
+}
+
+.advanced-empty-state {
+  width: 100%;
+  max-width: 460px;
+  margin: 0 auto;
+}
+
+/* --- Narrow workbench: sources become a horizontal chip bar --- */
+.advanced-workbench.stacked-layout {
+  grid-template-columns: minmax(0, 1fr) !important;
+  grid-template-rows: auto minmax(0, 1fr) !important;
+}
+
+.advanced-workbench.stacked-layout .advanced-sidebar {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  height: auto !important;
+  padding: 8px 10px;
+  border-right: none;
+  border-bottom: 1px solid var(--panel-divider-color);
+  overflow: visible;
+}
+
+.advanced-workbench.stacked-layout .advanced-sidebar-search {
+  position: relative;
+  flex: 0 0 130px;
+  padding: 0;
+}
+
+.advanced-workbench.stacked-layout .advanced-search-input {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.advanced-workbench.stacked-layout .advanced-search-results {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  width: 248px;
+  margin-top: 0;
+  padding: 6px;
+  border-radius: 12px;
+  border: var(--panel-border);
+  /* Two layers so the panel stays opaque over any theme's translucent panel colour. */
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05)),
+    linear-gradient(var(--bg-panel), var(--bg-panel)),
+    var(--bg-content);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 22px 48px rgba(0, 0, 0, 0.6),
+    0 6px 16px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+:root.dark-mode .advanced-workbench.stacked-layout .advanced-search-results {
+  border-color: rgba(255, 255, 255, 0.2);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.55),
+    0 24px 54px rgba(0, 0, 0, 0.7),
+    0 8px 18px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.advanced-workbench.stacked-layout .advanced-target-list {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.advanced-workbench.stacked-layout .advanced-target-list::-webkit-scrollbar {
+  display: none !important;
+}
+
+.advanced-workbench.stacked-layout .advanced-target-item {
+  width: auto;
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 12px;
+  gap: 6px;
+  border-radius: 999px;
+}
+
+.advanced-workbench.stacked-layout .advanced-target-name {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.advanced-workbench.stacked-layout .advanced-target-sub {
+  display: none;
+}
+
+.advanced-workbench.stacked-layout .advanced-target-item:hover .advanced-target-meta,
+.advanced-workbench.stacked-layout .advanced-target-item.active .advanced-target-meta {
+  padding-right: 0;
+}
+
+.advanced-workbench.stacked-layout .advanced-target-delete {
+  position: static;
+  transform: none;
+  width: 18px;
+  height: 18px;
+  border: none;
+  flex-shrink: 0;
+  opacity: 0.45;
+  pointer-events: auto;
+}
+
+.advanced-workbench.stacked-layout .advanced-target-item:hover .advanced-target-delete {
+  opacity: 1;
+}
+
+.advanced-workbench.stacked-layout .advanced-divider {
+  display: none;
+}
+
+.advanced-workbench.stacked-layout .advanced-editor-toolbar {
+  padding: 12px 14px;
+}
+
+.advanced-workbench.stacked-layout .advanced-editor-title {
+  font-size: 13px;
+}
+
+.advanced-workbench.stacked-layout .advanced-action-toggle {
+  margin: 10px 14px 0;
+  padding: 10px 12px;
+}
+
+.advanced-workbench.stacked-layout .advanced-rule-list {
+  padding: 12px 14px 60px;
+}
+
+.advanced-workbench.stacked-layout .advanced-rule-header {
+  padding: 14px 16px;
+}
+
+.advanced-workbench.stacked-layout .advanced-rule-body {
+  padding: 0 16px 16px;
+  gap: 14px;
 }
 
 .settings-view input[type="range"]::-webkit-slider-runnable-track {

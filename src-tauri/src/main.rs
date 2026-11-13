@@ -130,6 +130,8 @@ fn main() {
             app::commands::open_file_with_default_app,
             app::commands::open_file_location,
             app::commands::set_data_path,
+            services::config_backup::export_config_now,
+            services::config_backup::import_config,
             app::commands::toggle_autostart,
             app::commands::is_autostart_enabled,
             app::commands::set_windows_clipboard_history,
@@ -151,6 +153,7 @@ fn main() {
             app::commands::update_tags,
             app::commands::add_manual_item,
             app::commands::update_item_content,
+            app::commands::update_entry_note,
             app::commands::save_emoji_favorite,
             app::commands::remove_emoji_favorite,
             app::commands::list_emoji_favorites,
@@ -191,7 +194,11 @@ fn main() {
     match app {
         Ok(app) => {
             info!(">>> [STARTUP] Tauri app built successfully.");
-            app.run(|_app_handle, _event| {});
+            app.run(|app_handle, event| {
+                if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                    services::config_backup::backup_on_exit(app_handle);
+                }
+            });
         }
         Err(e) => {
             error!(">>> [STARTUP] Failed to build tauri app: {}", e);

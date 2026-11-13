@@ -6,6 +6,7 @@ interface HistoryFilterBarProps {
   t: (key: string) => string;
   search: string;
   typeFilter: string | null;
+  fileCategoryLabel?: string;
   count: number;
   hasMore: boolean;
   status: "loading" | "ready" | "error";
@@ -20,14 +21,14 @@ interface HistoryFilterBarProps {
 }
 
 export default function HistoryFilterBar({
-  t, search, typeFilter, count, hasMore, status, loadingMore, limited, hasSavedData,
+  t, search, typeFilter, fileCategoryLabel, count, hasMore, status, loadingMore, limited, hasSavedData,
   onClearSearch, onClearType, onClearAll, onRetry, onLoadMore
 }: HistoryFilterBarProps) {
   const parsed = parseHistorySearch(search);
-  const active = search.trim().length > 0 || !!typeFilter;
+  const active = search.trim().length > 0 || !!typeFilter || !!fileCategoryLabel;
   const typeName = typeFilter ? t(`type_${typeFilter === "link" ? "url" : typeFilter}`) : "";
   const searchLabel = `${t(parsed.tagOnly ? "filter_tag" : "filter_keyword")}: ${parsed.term || t("filter_all")}`;
-  const typeLabel = `${t("filter_type")}: ${typeName}`;
+  const typeLabel = `${t(fileCategoryLabel ? "sidebar_formats" : "filter_type")}: ${fileCategoryLabel || typeName}`;
   const message = status === "loading"
     ? t(loadingMore ? "filter_loading_more" : "filter_loading")
     : status === "error"
@@ -46,7 +47,7 @@ export default function HistoryFilterBar({
               <span>{searchLabel}</span><X size={12} aria-hidden="true" />
             </button>
           )}
-          {typeFilter && (
+          {(typeFilter || fileCategoryLabel) && (
             <button type="button" className="history-filter-chip" onClick={onClearType}
               title={typeLabel} aria-label={`${t("filter_remove")} ${typeLabel}`}>
               <span>{typeLabel}</span><X size={12} aria-hidden="true" />
@@ -80,7 +81,7 @@ export default function HistoryFilterBar({
           <strong>{t("filter_empty")}</strong>
           <p>{t("filter_empty_hint")}</p>
           <div className="history-filter-empty-actions">
-            {typeFilter && <button type="button" className="history-filter-action" onClick={onClearType}>{t("filter_remove_type")}</button>}
+            {(typeFilter || fileCategoryLabel) && <button type="button" className="history-filter-action" onClick={onClearType}>{t("filter_remove_type")}</button>}
             <button type="button" className="history-filter-action" onClick={onClearAll}>{t("filter_clear_all")}</button>
           </div>
         </div>

@@ -1937,6 +1937,7 @@ fn apply_remote_changes(
                 || item.content_type == "video",
             pinned_order: item.pinned_order,
             file_preview_exists: true,
+            note: String::new(),
         };
 
         db_state

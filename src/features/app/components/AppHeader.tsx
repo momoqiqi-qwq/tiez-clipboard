@@ -14,8 +14,8 @@ import {
   X
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { getTagColor, getTagTextColor } from "../../../shared/lib/utils";
 import TagFilterPicker from "./TagFilterPicker";
+import { useDraggableActions } from "../hooks/useDraggableActions";
 import { parseHistorySearch } from "../../../shared/lib/historySearch";
 
 interface AppHeaderProps {
@@ -41,18 +41,11 @@ interface AppHeaderProps {
   onCommitSearch: (val: string) => void;
   setIsComposing: (val: boolean) => void;
   searchInputRef: RefObject<HTMLInputElement | null>;
-  showTagFilter: boolean;
-  setShowTagFilter: (val: boolean) => void;
-  allTags: string[];
   filterTags: string[];
-  searchIsFocused: boolean;
-  setSearchIsFocused: (val: boolean) => void;
   setEditingTagsId: (val: number | null) => void;
   theme: string;
   colorMode: string;
   settingsTitle: string;
-  typeFilter: string | null;
-  setTypeFilter: (val: string | null) => void;
   onBack: () => void;
   onToggleChat: () => void;
 }
@@ -80,38 +73,20 @@ const AppHeader = ({
   onCommitSearch,
   setIsComposing,
   searchInputRef,
-  showTagFilter,
-  setShowTagFilter,
-  allTags,
   filterTags,
-  searchIsFocused,
-  setSearchIsFocused,
   setEditingTagsId,
   theme,
   colorMode,
   settingsTitle,
-  typeFilter,
-  setTypeFilter,
   onBack,
   onToggleChat
 }: AppHeaderProps) => {
-  const getTypeName = (type: string) => {
-    switch (type) {
-      case "code": return t('type_code');
-      case "link":
-      case "url": return t('type_url');
-      case "file": return t('type_file');
-      case "image": return t('type_image');
-      case "video": return t('type_video');
-      case "rich_text": return t('type_rich_text');
-      default: return t('type_text') || 'Text';
-    }
-  };
-
   // A tag switch reuses the existing `tag:<name>` search syntax, so filtering
   // goes through the backend tag search instead of adding a second filter state.
   const parsedSearch = parseHistorySearch(search);
   const activeTagFilter = parsedSearch.tagOnly ? parsedSearch.normalizedTerm : "";
+
+  const actionsBar = useDraggableActions();
 
   const toggleTagFilter = (tag: string) => {
     onCommitSearch(activeTagFilter && activeTagFilter === tag.trim().toLowerCase() ? "" : `tag:${tag}`);
@@ -138,63 +113,75 @@ const AppHeader = ({
           </span>
         </div>
       </div>
-      <div className="header-actions window-no-drag">
-        {/* Pin Button - Always visible but single instance */}
-        <button
-          className={`btn-icon ${isWindowPinned ? 'active' : ''}`}
-          title={t('pin')}
-          onClick={() => {
-            const newVal = !isWindowPinned;
-            setIsWindowPinned(newVal);
-            invoke("set_window_pinned", { pinned: newVal }).catch(console.error);
-          }}
-        >
-          {isWindowPinned ? <PinOff size={16} /> : <Pin size={16} />}
-        </button>
-
-        {!showSettings && !showTagManager && !showEmojiPanel && (
-          <>
-            <button className="btn-icon" title={t('clear_history')} onClick={clearHistory}>
-              <Trash2 size={16} />
-            </button>
-            {tagManagerEnabled && (
-              <button className="btn-icon" title={t('tag_manager') || '标签管理'} onClick={() => setShowTagManager(true)}>
-                <Tag size={16} />
-              </button>
-            )}
-            {emojiPanelEnabled && (
-              <button className="btn-icon" title={t('emoji_panel') || '表情包'} onClick={() => setShowEmojiPanel(true)}>
-                <Smile size={16} />
-              </button>
-            )}
-            <button
-              className={`btn-icon ${dragOutEnabled ? 'active' : ''}`}
-              title={dragOutEnabled
-                ? (t('drag_out_on') || '拖拽导出已开启：按住条目拖到文件夹')
-                : (t('drag_out') || '拖拽导出：可以拖动剪贴板内容到文件夹')}
-              onClick={() => setDragOutEnabled(!dragOutEnabled)}
-            >
-              <FolderDown size={16} />
-            </button>
-            <button className="btn-icon" title={t('settings')} onClick={() => setShowSettings(true)}>
-              <SettingsIcon size={16} />
-            </button>
-          </>
-        )}
-        {fileServerEnabled && (
+      <div
+        ref={actionsBar.ref}
+        className={`header-actions window-no-drag${actionsBar.dragging ? " is-dragging" : ""}${actionsBar.settling ? " is-settling" : ""}`}
+        style={actionsBar.style}
+        {...actionsBar.handlers}
+      >
+        <div className="header-actions-inner" style={actionsBar.innerStyle}>
+          <span
+            className="header-actions-grip"
+            title={t('toolbar_drag_hint') || '按住拖动，双击复位'}
+            aria-hidden="true"
+          />
+          {/* Pin Button - Always visible but single instance */}
           <button
-            className={`btn-icon header-chat-btn ${chatMode && showSettings ? 'active' : ''}`}
-            title="Chat"
-            onClick={onToggleChat}
+            className={`btn-icon ${isWindowPinned ? 'active' : ''}`}
+            title={t('pin')}
+            onClick={() => {
+              const newVal = !isWindowPinned;
+              setIsWindowPinned(newVal);
+              invoke("set_window_pinned", { pinned: newVal }).catch(console.error);
+            }}
           >
-            <MessageSquare size={16} />
+            {isWindowPinned ? <PinOff size={16} /> : <Pin size={16} />}
           </button>
-        )}
-        <button className="btn-icon" title={t('hide')} onClick={async () => {
-          invoke("hide_window_cmd").catch(console.error);
-        }}>
-          <X size={16} />
-        </button>
+
+          {!showSettings && !showTagManager && !showEmojiPanel && (
+            <>
+              <button className="btn-icon" title={t('clear_history')} onClick={clearHistory}>
+                <Trash2 size={16} />
+              </button>
+              {tagManagerEnabled && (
+                <button className="btn-icon" title={t('tag_manager') || '标签管理'} onClick={() => setShowTagManager(true)}>
+                  <Tag size={16} />
+                </button>
+              )}
+              {emojiPanelEnabled && (
+                <button className="btn-icon" title={t('emoji_panel') || '表情包'} onClick={() => setShowEmojiPanel(true)}>
+                  <Smile size={16} />
+                </button>
+              )}
+              <button
+                className={`btn-icon ${dragOutEnabled ? 'active' : ''}`}
+                title={dragOutEnabled
+                  ? (t('drag_out_on') || '拖拽导出已开启：按住条目拖到文件夹')
+                  : (t('drag_out') || '拖拽导出：可以拖动剪贴板内容到文件夹')}
+                onClick={() => setDragOutEnabled(!dragOutEnabled)}
+              >
+                <FolderDown size={16} />
+              </button>
+              <button className="btn-icon" title={t('settings')} onClick={() => setShowSettings(true)}>
+                <SettingsIcon size={16} />
+              </button>
+            </>
+          )}
+          {fileServerEnabled && (
+            <button
+              className={`btn-icon header-chat-btn ${chatMode && showSettings ? 'active' : ''}`}
+              title="Chat"
+              onClick={onToggleChat}
+            >
+              <MessageSquare size={16} />
+            </button>
+          )}
+          <button className="btn-icon header-actions-close" title={t('hide')} onClick={async () => {
+            invoke("hide_window_cmd").catch(console.error);
+          }}>
+            <X size={16} />
+          </button>
+        </div>
       </div>
     </div>
 
@@ -218,7 +205,7 @@ const AppHeader = ({
                 <input
                   ref={searchInputRef}
                   type="text"
-                  className={`search-input ${showTagFilter && allTags.length > 0 ? 'dropdown-open' : ''}`}
+                  className="search-input"
                   placeholder={t('search_placeholder')}
                   value={search}
                   onCompositionStart={() => setIsComposing(true)}
@@ -232,86 +219,14 @@ const AppHeader = ({
                   onMouseDown={() => {
                     invoke("activate_window_focus").catch(console.error);
                   }}
-                  onClick={() => { setShowTagFilter(true); setEditingTagsId(null); }}
+                  onClick={() => setEditingTagsId(null)}
                   onFocus={() => {
                     invoke("activate_window_focus").catch(console.error);
-                    setShowTagFilter(true);
-                    setSearchIsFocused(true);
                     setEditingTagsId(null);
-                  }}
-                  onBlur={() => {
-                    setTimeout(() => {
-                      setShowTagFilter(false);
-                      setSearchIsFocused(false);
-                    }, 200);
                   }}
                   style={{ color: colorMode === 'dark' ? '#ffffff' : undefined }}
                 />
-                {showTagFilter && searchIsFocused && allTags.length > 0 && (
-                  <div className="tags-dropdown">
-                    <div className="tags-label">{t('tags') || "Tags"}</div>
-                    <div className="tags-list">
-                      {allTags.map(tag => {
-                        const tagBackground = getTagColor(tag, theme);
-                        return (
-                          <button
-                            type="button"
-                            className="tag-chip"
-                            key={tag}
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => {
-                              onCommitSearch("tag:" + tag);
-                              setShowTagFilter(false);
-                            }}
-                            title={tag}
-                            data-tag={tag}
-                            style={{ background: tagBackground, color: getTagTextColor(tagBackground) }}
-                          >
-                            {tag}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
               </div>
-              <div
-                className="hide-scrollbar"
-                style={{
-                  display: 'flex',
-                  gap: '6px',
-                  padding: '8px 0 0 0',
-                  overflowX: 'auto',
-                  scrollbarWidth: 'none',
-                  msOverflowStyle: 'none'
-                }}
-                onWheel={(e) => {
-                  if (e.deltaY !== 0) {
-                    e.currentTarget.scrollLeft += e.deltaY;
-                  }
-                }}
-              >
-                {['text', 'image', 'file', 'url', 'code', 'video', 'rich_text'].map(t => (
-                  <button
-                    key={t}
-                    className={`btn-icon ${typeFilter === t ? 'active' : ''}`}
-                    onClick={() => setTypeFilter(typeFilter === t ? null : t)}
-                    style={{
-                      width: 'auto',
-                      padding: '4px 8px',
-                      fontSize: '11px',
-                      borderRadius: '4px',
-                      whiteSpace: 'nowrap',
-                      flexShrink: 0,
-                      opacity: typeFilter === t ? 1 : 0.7
-                    }}
-                    title={getTypeName(t)}
-                  >
-                    {getTypeName(t)}
-                  </button>
-                ))}
-              </div>
-
               <TagFilterPicker tags={filterTags} activeTag={activeTagFilter} theme={theme}
                 t={t} onSelect={toggleTagFilter} />
 

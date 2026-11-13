@@ -39,6 +39,7 @@ docs/CLOUD-SYNC-IMPLEMENTATION.md
 artifacts/
 .dsh-artifacts/
 .workbuddy/
+tmp/
 conflicts.txt
 git_graph.txt
 git_log_out.txt

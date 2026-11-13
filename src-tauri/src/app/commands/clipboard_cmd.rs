@@ -192,6 +192,7 @@ pub async fn add_manual_item(
         is_external: false,
         pinned_order: 0,
         file_preview_exists: true,
+        note: String::new(),
     };
 
     let app_data_dir = app_handle.state::<AppDataDir>();
@@ -223,6 +224,38 @@ pub async fn update_item_content(
     state
         .repo
         .update_entry_content(id, &new_content, &preview)
+        .map_err(AppError::from)?;
+    let _ = app_handle.emit("clipboard-changed", ());
+    crate::services::cloud_sync::request_cloud_sync(app_handle);
+    Ok(())
+}
+
+/// Attach (or clear) the free-form note of one entry.
+///
+/// Session entries (negative id) are not in the database yet, so the note lives in
+/// the in-memory item until the entry is saved for real — same rule as their tags.
+#[tauri::command]
+pub async fn update_entry_note(
+    app_handle: AppHandle,
+    state: State<'_, DbState>,
+    session: State<'_, SessionHistory>,
+    id: i64,
+    note: String,
+) -> AppResult<()> {
+    if id < 0 {
+        {
+            let mut session_items = session.inner().0.lock().unwrap();
+            if let Some(item) = session_items.iter_mut().find(|i| i.id == id) {
+                item.note = note.trim().to_string();
+            }
+        }
+        let _ = app_handle.emit("clipboard-changed", ());
+        return Ok(());
+    }
+
+    state
+        .repo
+        .update_entry_note(id, &note)
         .map_err(AppError::from)?;
     let _ = app_handle.emit("clipboard-changed", ());
     crate::services::cloud_sync::request_cloud_sync(app_handle);

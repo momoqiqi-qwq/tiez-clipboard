@@ -89,6 +89,7 @@ export const useKeyboardNavigation = ({
       }
 
       const target = e.target as HTMLElement;
+      if (target.closest("dialog[open], .file-sidebar")) return;
       const tagName = target.tagName;
       const isSearchInput = target.classList.contains("search-input");
       const isAnyInput = tagName === "INPUT" || tagName === "TEXTAREA";

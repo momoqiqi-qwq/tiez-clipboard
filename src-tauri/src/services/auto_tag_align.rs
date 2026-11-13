@@ -10,7 +10,11 @@ use crate::services::auto_tag::{OFFICIAL_AUTO_TAGS, classify_auto_tags, is_syste
 /// once more over the whole history.
 ///
 /// v3: composition tags (纯数字/纯字母/数字字母) added for unrecognized content.
-const REALIGNMENT_FLAG: &str = "db.auto_tag_realignment_v3_done";
+/// v4: shape tags (长文本/AI提示词) so existing history can be filtered by them
+///     instead of only the entries captured after the upgrade.
+/// v5: the prompt rule now requires its ask in the opening stretch; v4 had
+///     already been written by the time that tightened, so it runs again.
+const REALIGNMENT_FLAG: &str = "db.auto_tag_realignment_v5_done";
 
 /// One-time realignment over the entire history: re-run classification with
 /// the current rules, add missing official tags ("sensitive" is the superset
@@ -96,6 +100,10 @@ fn run_alignment(app_handle: AppHandle) {
             // Entries already carrying a category tag plus "sensitive" were
             // tagged by the current rules and are encrypted; re-deriving their
             // tags would require a pointless decrypt/encrypt round trip.
+            // Trade-off: such an entry also misses the shape tags (长文本 /
+            // AI提示词). Secret-bearing entries are short tokens far more often
+            // than documents, and everything captured from now on is classified
+            // live by the capture pipeline, so the skip stays.
             let has_category = existing_tags
                 .iter()
                 .any(|t| OFFICIAL_AUTO_TAGS.iter().any(|o| o.eq_ignore_ascii_case(t)));

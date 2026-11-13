@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod clipboard_listener;
 pub mod clipboard_ops;
 pub mod cloud_sync;
+pub mod config_backup;
 pub mod content_handler;
 pub mod drag_out;
 pub mod encryption_queue;

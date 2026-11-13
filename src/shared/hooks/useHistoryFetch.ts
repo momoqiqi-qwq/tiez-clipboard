@@ -23,6 +23,7 @@ const validateHistory = (value: unknown): ClipboardEntry[] => {
 interface UseHistoryFetchOptions {
   debouncedSearch: string;
   typeFilter: string | null;
+  fileExtensions?: string[];
   persistentLimitEnabled: boolean;
   persistentLimit: number;
   pageSize: number;
@@ -39,6 +40,7 @@ interface UseHistoryFetchOptions {
 export const useHistoryFetch = ({
   debouncedSearch,
   typeFilter,
+  fileExtensions,
   persistentLimitEnabled,
   persistentLimit,
   pageSize,
@@ -57,7 +59,8 @@ export const useHistoryFetch = ({
     limited: boolean;
   }>({ phase: "loading", queryKey: "", limited: false });
   const errorRef = useRef<{ reset: boolean; queryKey: string } | null>(null);
-  const queryKey = JSON.stringify([debouncedSearch, typeFilter]);
+  const extensionsKey = fileExtensions?.join(" ") || "";
+  const queryKey = JSON.stringify([debouncedSearch, typeFilter, extensionsKey]);
   const mountedRef = useRef(true);
   const loadingRef = useRef(false);
   const resetPendingRef = useRef(false);
@@ -102,7 +105,30 @@ export const useHistoryFetch = ({
 
         const { term, tagOnly } = parseHistorySearch(debouncedSearch);
 
-        if (term && tagOnly) {
+        if (extensionsKey) {
+          const offset = reset ? 0 : currentOffsetRef.current;
+          const response = await invoke<unknown>("search_clipboard_history", {
+            searchTerm: term, tagOnly, limit: pageSize + 1, offset,
+            fileExtensions: extensionsKey.split(" ")
+          });
+          if (seq !== fetchSeqRef.current) return;
+          const rawData = validateHistory(response);
+          const page = rawData.slice(0, pageSize);
+          if (reset) setHistory(page);
+          else setHistory(prev => {
+            const seen = new Set(prev.filter(item => item.id !== 0).map(item => item.id));
+            return [...prev, ...page.filter(item => {
+              if (item.id === 0) return true;
+              if (seen.has(item.id)) return false;
+              seen.add(item.id);
+              return true;
+            })];
+          });
+          loadedTagQueryRef.current = null;
+          currentOffsetRef.current = offset + page.length;
+          setCurrentOffset(currentOffsetRef.current);
+          setHasMore(rawData.length > pageSize);
+        } else if (term && tagOnly) {
           // Offset counts the merged search results, including transient id=0 entries.
           const queryKey = JSON.stringify([term.toLowerCase(), typeFilter]);
           const replace = reset || loadedTagQueryRef.current !== queryKey;
@@ -190,7 +216,7 @@ export const useHistoryFetch = ({
             setHasMore(hasMoreNow);
           }
         }
-        setRequestState({ phase: "ready", queryKey, limited: !!term && !tagOnly && data.length >= 200 });
+        setRequestState({ phase: "ready", queryKey, limited: !extensionsKey && !!term && !tagOnly && data.length >= 200 });
       } catch (err) {
         // A failed obsolete request must not change the current query's state.
         if (seq !== fetchSeqRef.current) return;
@@ -207,6 +233,7 @@ export const useHistoryFetch = ({
       debouncedSearch,
       queryKey,
       typeFilter,
+      extensionsKey,
       pageSize,
       persistentLimit,
       persistentLimitEnabled,
@@ -220,9 +247,9 @@ export const useHistoryFetch = ({
     if (!mountedRef.current || resetPendingRef.current || loadingRef.current || isLoadingMore || !hasMore) return;
     if (errorRef.current && !retry) return;
     const { term, tagOnly } = parseHistorySearch(debouncedSearch);
-    if (term && !tagOnly) return;
+    if (term && !tagOnly && !extensionsKey) return;
 
-    const effectiveOffset = term && tagOnly
+    const effectiveOffset = extensionsKey ? currentOffsetRef.current : term && tagOnly
       ? (loadedTagQueryRef.current === JSON.stringify([term.toLowerCase(), typeFilter]) ? currentOffsetRef.current : 0)
       : Math.min(currentOffsetRef.current, historyLengthRef.current);
     if (lastRequestedOffsetRef.current === effectiveOffset) return;
@@ -236,7 +263,7 @@ export const useHistoryFetch = ({
       loadingRef.current = false;
       if (mountedRef.current) setIsLoadingMore(false);
     }
-  }, [debouncedSearch, typeFilter, fetchHistory, hasMore, isLoadingMore, setIsLoadingMore]);
+  }, [debouncedSearch, typeFilter, extensionsKey, fetchHistory, hasMore, isLoadingMore, setIsLoadingMore]);
 
   const retryHistory = useCallback(async () => {
     if (resetPendingRef.current || loadingRef.current) return;

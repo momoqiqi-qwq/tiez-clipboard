@@ -173,6 +173,7 @@ impl PipelineStage for DiscoveryStage {
             is_external,
             pinned_order: 0,
             file_preview_exists: true,
+            note: String::new(),
         });
     }
 }

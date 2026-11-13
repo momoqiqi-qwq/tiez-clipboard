@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use urlencoding::decode;
 
 mod tag_search;
+mod file_search;
 
 const RICH_IMAGE_FALLBACK_PREFIX: &str = "<!--TIEZ_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX: &str = "-->";
@@ -86,6 +87,7 @@ pub trait ClipboardRepository {
         content_type: Option<&str>,
     ) -> Result<Option<i64>, String>;
     fn update_entry_content(&self, id: i64, content: &str, preview: &str) -> Result<(), String>;
+    fn update_entry_note(&self, id: i64, note: &str) -> Result<(), String>;
     fn get_entry_content(&self, id: i64) -> Result<Option<String>, String>;
     fn get_entry_content_full(&self, id: i64) -> Result<Option<(String, String)>, String>;
     fn get_entry_content_with_html(
@@ -476,8 +478,8 @@ impl SqliteClipboardRepository {
         } else {
             // Insert new entry
             conn.execute(
-                "INSERT INTO clipboard_history (content_type, content, html_content, source_app, timestamp, preview, is_pinned, content_hash, tags, is_external, pinned_order, source_app_path) 
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO clipboard_history (content_type, content, html_content, source_app, timestamp, preview, is_pinned, content_hash, tags, is_external, pinned_order, source_app_path, note) 
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     entry.content_type,
                     content,
@@ -490,7 +492,10 @@ impl SqliteClipboardRepository {
                     serde_json::to_string(&cleaned_tags).unwrap_or_else(|_| "[]".to_string()),
                     if final_is_external { 1 } else { 0 },
                     entry.pinned_order,
-                    entry.source_app_path.as_deref()
+                    entry.source_app_path.as_deref(),
+                    // A note typed on a session entry (id < 0) must survive the moment
+                    // that entry is written for the first time.
+                    entry.note.trim()
                 ],
             ).map_err(|e| e.to_string())?;
 
@@ -725,13 +730,35 @@ impl SqliteClipboardRepository {
         Ok(())
     }
 
+    /// Store (or clear, with an empty string) the free-form annotation of one entry.
+    /// The note is trimmed first so a textarea of blank lines clears it instead of
+    /// leaving invisible whitespace that later reads as "has a note".
+    pub fn update_entry_note_with_conn(
+        &self,
+        conn: &Connection,
+        id: i64,
+        note: &str,
+    ) -> Result<(), String> {
+        let cleaned = note.trim();
+        let changed = conn
+            .execute(
+                "UPDATE clipboard_history SET note = ?1 WHERE id = ?2",
+                params![cleaned, id],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err(format!("Entry {} not found", id));
+        }
+        Ok(())
+    }
+
     pub fn get_entry_by_id_with_conn(
         &self,
         conn: &Connection,
         id: i64,
     ) -> Result<Option<ClipboardEntry>, String> {
         let mut stmt = conn.prepare(
-            "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path 
+            "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, note
              FROM clipboard_history 
              WHERE id = ? 
              LIMIT 1",
@@ -762,6 +789,7 @@ impl SqliteClipboardRepository {
                 is_external: row.get::<_, i32>(10).unwrap_or(0) == 1,
                 pinned_order: row.get(11).unwrap_or(0),
                 source_app_path: row.get(12).unwrap_or(None),
+                note: row.get(13).unwrap_or_default(),
                 file_preview_exists: true,
             }))
         } else {
@@ -936,6 +964,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                     is_external: row.get::<_, i32>(10)? == 1,
                     pinned_order: row.get(11).unwrap_or(0),
                     source_app_path: row.get(12).unwrap_or(None),
+                    note: row.get(13).unwrap_or_default(),
                     // Avoid synchronous filesystem existence checks in history query.
                     // Missing files are still handled by frontend image/file preview error fallback.
                     file_preview_exists: true,
@@ -951,7 +980,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
         let mut mapped_rows = Vec::new();
         if let Some(ct) = content_type {
             let mut stmt = conn.prepare(
-                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path 
+                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, note
                  FROM clipboard_history 
                  WHERE content_type = ? 
                  ORDER BY is_pinned DESC, pinned_order DESC, timestamp DESC, id DESC 
@@ -965,7 +994,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
             }
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path 
+                "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, note
                  FROM clipboard_history 
                  ORDER BY is_pinned DESC, pinned_order DESC, timestamp DESC, id DESC 
                  LIMIT ? OFFSET ?",
@@ -1013,19 +1042,20 @@ impl ClipboardRepository for SqliteClipboardRepository {
         {
             // Portable version: Data is NOT encrypted, use conventional SQL LIKE search (fastest)
             let sql = if tag_only {
-                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path
+                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.note
                  FROM clipboard_history ch
                  INNER JOIN entry_tags et ON ch.id = et.entry_id
                  WHERE et.tag LIKE '%' || ?1 || '%'
                  ORDER BY ch.timestamp DESC
                  LIMIT ?2"
             } else {
-                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path
+                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.note
                  FROM clipboard_history ch
                  LEFT JOIN entry_tags et ON ch.id = et.entry_id
                  WHERE ch.content LIKE '%' || ?1 || '%'
                     OR ch.source_app LIKE '%' || ?1 || '%'
                     OR et.tag LIKE '%' || ?1 || '%'
+                    OR ch.note LIKE '%' || ?1 || '%'
                  ORDER BY ch.timestamp DESC
                  LIMIT ?2"
             };
@@ -1050,6 +1080,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                         is_external: row.get::<_, i32>(10)? == 1,
                         pinned_order: row.get(11).unwrap_or(0),
                         source_app_path: row.get(12).unwrap_or(None),
+                        note: row.get(13).unwrap_or_default(),
                         file_preview_exists: true, // Simplified for search
                     })
                 })
@@ -1089,7 +1120,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
 
             let sql_non_sensitive = if tag_only {
                 format!(
-                    "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path
+                    "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.note
                      FROM clipboard_history ch
                      INNER JOIN entry_tags et ON ch.id = et.entry_id
                      WHERE NOT EXISTS (
@@ -1104,7 +1135,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                 )
             } else if use_fts {
                 format!(
-                    "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path
+                    "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.note
                      FROM clipboard_fts
                      JOIN clipboard_history ch ON ch.id = clipboard_fts.rowid
                      WHERE clipboard_fts MATCH ?1
@@ -1119,7 +1150,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                 )
             } else {
                 format!(
-                    "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path
+                    "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.note
                      FROM clipboard_history ch
                      LEFT JOIN entry_tags et ON ch.id = et.entry_id
                      WHERE NOT EXISTS (
@@ -1131,6 +1162,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                          ch.content LIKE '%' || ?1 || '%'
                          OR ch.source_app LIKE '%' || ?1 || '%'
                          OR et.tag LIKE '%' || ?1 || '%'
+                         OR ch.note LIKE '%' || ?1 || '%'
                        )
                      ORDER BY ch.timestamp DESC, ch.id DESC
                      LIMIT ?2",
@@ -1169,6 +1201,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                         is_external: row.get::<_, i32>(10)? == 1,
                         pinned_order: row.get(11).unwrap_or(0),
                         source_app_path: row.get(12).unwrap_or(None),
+                        note: row.get(13).unwrap_or_default(),
                         file_preview_exists: true,
                     })
                 })
@@ -1182,6 +1215,45 @@ impl ClipboardRepository for SqliteClipboardRepository {
                 }
             }
 
+            // 1b) Notes are free text and live OUTSIDE the FTS index (which
+            // only mirrors `content`), so a note-only hit would be invisible
+            // to a trigram query. One cheap LIKE pass over `note` closes that
+            // gap without rebuilding the index; the LIKE branch above already
+            // covers the non-FTS path.
+            if use_fts && !tag_only && results.len() < limit as usize {
+                let sql_note_ids = format!(
+                    "SELECT ch.id FROM clipboard_history ch
+                     WHERE ch.note <> ''
+                       AND ch.note LIKE '%' || ?1 || '%'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM entry_tags se
+                           WHERE se.entry_id = ch.id
+                             AND se.tag COLLATE NOCASE IN {}
+                       )
+                     ORDER BY ch.timestamp DESC, ch.id DESC
+                     LIMIT ?2",
+                    sensitive_tags_sql
+                );
+
+                if let Ok(mut stmt) = conn.prepare(&sql_note_ids) {
+                    let ids = stmt
+                        .query_map(params![term, limit], |row| row.get::<_, i64>(0))
+                        .map(|rows| rows.filter_map(Result::ok).collect::<Vec<i64>>())
+                        .unwrap_or_default();
+
+                    for id in ids {
+                        if results.len() >= limit as usize {
+                            break;
+                        }
+                        if seen.insert(id) {
+                            if let Ok(Some(entry)) = self.get_entry_by_id_with_conn(&conn, id) {
+                                results.push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+
             // 2) Decrypt-scan sensitive or encrypted entries (only if needed)
             if results.len() < limit as usize {
                 let mut cursor_ts = i64::MAX;
@@ -1189,7 +1261,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                 let batch_size = 500;
                 let enc_like = format!("{}%", ENCRYPT_PREFIX);
                 let sql_sensitive = format!(
-                    "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path 
+                    "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.note
                      FROM clipboard_history ch
                      WHERE (
                          EXISTS (
@@ -1226,6 +1298,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                                 is_external: row.get::<_, i32>(10)? == 1,
                                 pinned_order: row.get(11).unwrap_or(0),
                                 source_app_path: row.get(12).unwrap_or(None),
+                                note: row.get(13).unwrap_or_default(),
                                 file_preview_exists: true,
                             })
                         })
@@ -1259,6 +1332,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
                             contains_lower(&entry.content, &term)
                                 || contains_lower(&entry.source_app, &term)
                                 || entry.tags.iter().any(|t| contains_lower(t, &term))
+                                || contains_lower(&entry.note, &term)
                         };
 
                         if matches && seen.insert(entry.id) {
@@ -1385,6 +1459,11 @@ impl ClipboardRepository for SqliteClipboardRepository {
     fn update_entry_content(&self, id: i64, content: &str, preview: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         self.update_entry_content_with_conn(&conn, id, content, preview)
+    }
+
+    fn update_entry_note(&self, id: i64, note: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        self.update_entry_note_with_conn(&conn, id, note)
     }
 
     fn get_entry_content(&self, id: i64) -> Result<Option<String>, String> {

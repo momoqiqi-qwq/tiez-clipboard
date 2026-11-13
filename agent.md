@@ -20,3 +20,38 @@
 7. 纯性能优化、重构、内部清理(对外行为与接口不变、没有新功能)按「修复问题」处理,升小版本号。
 8. 纯文档 / 规则文件(如本文件)改动不改变程序行为,默认不升版本号;若要升,则必须重新构建并安装,保证安装版与源码版本号一致。
 9. 完成修改后,在最终答复中注明新的版本号,并说明本次属于「修复问题(小版本号)」还是「添加功能(大版本号)」。
+
+## 构建后更新本机应用(强制)
+
+**每次构建出 exe 后,必须把本机日常运行的 TieZ 换成这次构建的新版本。构建完不替换 = 没做完,不要交付。**
+
+- 目标:`E:\E-Apps\Quicker TOOL\Tiez\TieZ.exe`(直接覆盖,**不备份**)
+- 源:`src-tauri/target/release/tiez-app.exe`
+- 安装版与便携版共用上面这条源路径,后构建者覆盖前者。因此**必须以便携版收尾**:
+  1. `npm run tauri:build`(出安装包,NSIS / MSI)
+  2. `npm run build:portable`(= `npx tauri build --features portable --no-bundle`)
+  - 顺序不能反,否则 `target/release/tiez-app.exe` 停在安装版上。
+  - 禁止用 `cargo build --release` 出包:会内嵌 `http://localhost:1420`,运行空白 / ERR_CONNECTION_REFUSED。
+- 覆盖前校验源 exe:
+  - 必须含 `assets/index-`(生产前端已内嵌)
+  - 便携版必须**不含** `CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_fts`(portable feature 生效的证据)
+- TieZ 运行中会锁住 exe(覆盖报 os error 32):先结束进程,再复制。
+- 现成脚本(内建上面的校验 + 结束进程 + 覆盖 + 复核):
+
+  ```powershell
+  pwsh -File 'C:\Users\yile\.agents\skills\tiez-release-build\scripts\install-portable.ps1'
+  ```
+
+  不想动进程就加 `-KeepRunning`,脚本会中止并提示先手动退出 TieZ。
+- 手工等价写法:
+
+  ```powershell
+  Stop-Process -Name TieZ,tiez-app -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 900
+  Copy-Item 'E:\E-Develop-Project\tiez-clipboard-master\src-tauri\target\release\tiez-app.exe' 'E:\E-Apps\Quicker TOOL\Tiez\TieZ.exe' -Force
+  Get-Item 'E:\E-Apps\Quicker TOOL\Tiez\TieZ.exe' | Select-Object Length,LastWriteTime,@{n='Version';e={$_.VersionInfo.FileVersion}}
+  ```
+
+- 覆盖后复核:源与目标大小一致、目标时间已更新;不一致说明没覆盖成功,查文件占用。
+- 最终答复必须写清:新版本号、产物路径、已替换的目标路径 + 复核到的大小/版本。
+- 只改文档 / 规则、没有构建 → 不涉及本流程;构建失败或校验不通过 → **不许覆盖**,先把失败点报清楚。

@@ -11,6 +11,8 @@ import { useAppState } from "./features/app/hooks/useAppState";
 import { useSettingsPanelProps } from "./features/settings/hooks/useSettingsPanelProps";
 import { useSearchQuery } from "./shared/hooks/useSearchQuery";
 import HistoryFilterBar from "./features/app/components/HistoryFilterBar";
+import FileCategorySidebar, { fileCategoryName } from "./features/app/components/FileCategorySidebar";
+import { readFileCategories, type FileCategory } from "./shared/lib/fileCategories";
 import { useHistoryFetch } from "./shared/hooks/useHistoryFetch";
 import { useHotkeyConfig } from "./shared/hooks/useHotkeyConfig";
 import { useInputFocus } from "./shared/hooks/useInputFocus";
@@ -149,10 +151,7 @@ const App = () => {
     setSearch,
     isComposing,
     setIsComposing,
-    searchIsFocused,
     setSearchIsFocused,
-    showTagFilter,
-    setShowTagFilter,
     tagInput,
     setTagInput,
     showEmojiPanel,
@@ -347,6 +346,22 @@ const App = () => {
     setTypeFilter
   } = appState;
 
+  const [activeCategoryId, setActiveCategoryId] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem("tiez_sidebar_collapsed") !== "false"; } catch { return true; }
+  });
+  const fileCategories = useMemo(() => readFileCategories(appSettings["app.file_categories"]), [appSettings["app.file_categories"]]);
+  const activeFileCategory = fileCategories.find(item => item.id === activeCategoryId && item.visible);
+  const fileExtensions = activeFileCategory?.extensions;
+  const extensionsKey = fileExtensions?.join(" ") || "";
+  useEffect(() => {
+    if (activeCategoryId && !activeFileCategory) setActiveCategoryId(null);
+  }, [activeCategoryId, activeFileCategory]);
+  useEffect(() => {
+    const saved = appSettings["app.sidebar_collapsed"];
+    if (saved !== undefined) setSidebarCollapsed(saved !== "false");
+  }, [appSettings["app.sidebar_collapsed"]]);
+
   // --- Auto Update Logic ---
   const {
     isOpen: isUpdateOpen,
@@ -373,10 +388,12 @@ const App = () => {
   const clearAllFilters = useCallback(() => {
     applySearchImmediately("");
     setTypeFilter(null);
+    setActiveCategoryId(null);
   }, [applySearchImmediately, setTypeFilter]);
   const clearTypeFilter = useCallback(() => {
     applySearchImmediately(search);
     setTypeFilter(null);
+    setActiveCategoryId(null);
   }, [applySearchImmediately, search, setTypeFilter]);
   const searchInputRef = useInputFocus<HTMLInputElement>();
   const tagColors = useTagColors();
@@ -390,6 +407,7 @@ const App = () => {
   const { fetchHistory, loadMoreHistory, retryHistory, requestState } = useHistoryFetch({
     debouncedSearch,
     typeFilter,
+    fileExtensions,
     persistentLimitEnabled,
     persistentLimit,
     pageSize: PAGE_SIZE,
@@ -893,6 +911,24 @@ const App = () => {
       .catch(console.error);
   }, []);
 
+  const saveFileCategories = useCallback(async (categories: FileCategory[]) => {
+    const value = JSON.stringify(categories);
+    if (isTauriRuntime()) await invoke("save_setting", { key: "app.file_categories", value });
+    setAppSettings(prev => ({ ...prev, "app.file_categories": value }));
+  }, [setAppSettings]);
+  const toggleFileSidebar = useCallback(() => {
+    const collapsed = !sidebarCollapsed;
+    setSidebarCollapsed(collapsed);
+    try { localStorage.setItem("tiez_sidebar_collapsed", String(collapsed)); } catch { /* Startup cache is optional. */ }
+    void saveAppSetting("sidebar_collapsed", String(collapsed));
+  }, [sidebarCollapsed, saveAppSetting]);
+  const selectSidebarCategory = useCallback((type: string | null, categoryId?: string) => {
+    setActiveCategoryId(categoryId || null);
+    setTypeFilter(type);
+    applySearchImmediately(search);
+  }, [setTypeFilter, applySearchImmediately, search]);
+
+
   useSettingsSync({
     settingsLoaded,
     deduplicate,
@@ -990,16 +1026,17 @@ const App = () => {
   const filteredHistory = useFilteredHistory({
     history,
     search,
-    typeFilter
+    typeFilter,
+    fileExtensions
   });
 
   // The backend lookahead determines exhaustion, not the visible filtered count.
   const effectiveHasMore = hasMore;
   const historyPending = isComposing || search !== debouncedSearch
-    || requestState.queryKey !== JSON.stringify([debouncedSearch, typeFilter])
+    || requestState.queryKey !== JSON.stringify([debouncedSearch, typeFilter, extensionsKey])
     || requestState.phase === "loading";
   const historyFailed = !historyPending && requestState.phase === "error";
-  const hasActiveFilters = search.trim().length > 0 || !!typeFilter;
+  const hasActiveFilters = search.trim().length > 0 || !!typeFilter || !!activeFileCategory;
 
   const { pinnedItems, unpinnedItems, handlePinnedReorder } = usePinnedSort({
     filteredHistory,
@@ -1100,8 +1137,14 @@ const App = () => {
 
   return (
     <div
-      className="app-container"
+      className={`app-container${!showSettings && !effectiveShowTagManager && !effectiveShowEmojiPanel && !chatMode ? " has-file-sidebar" : ""}`}
     >
+      {!showSettings && !effectiveShowTagManager && !effectiveShowEmojiPanel && !chatMode && (
+        <FileCategorySidebar t={t} collapsed={sidebarCollapsed} categories={fileCategories}
+          activeCategoryId={activeCategoryId} typeFilter={typeFilter} onToggle={toggleFileSidebar}
+          onSelect={selectSidebarCategory} onSave={saveFileCategories} />
+      )}
+      <div className="app-workspace">
       <AppHeader
         t={t}
         showSettings={showSettings}
@@ -1125,18 +1168,11 @@ const App = () => {
         onCommitSearch={applySearchImmediately}
         setIsComposing={setIsComposing}
         searchInputRef={searchInputRef}
-        showTagFilter={showTagFilter}
-        setShowTagFilter={setShowTagFilter}
-        allTags={allTags}
         filterTags={filterTags}
-        searchIsFocused={searchIsFocused}
-        setSearchIsFocused={setSearchIsFocused}
         setEditingTagsId={setEditingTagsId}
         theme={theme}
         colorMode={colorMode}
         settingsTitle={showSettings && settingsSubpage === "advanced" ? t("advanced_settings") : t("settings")}
-        typeFilter={typeFilter}
-        setTypeFilter={setTypeFilter}
         onBack={handleHeaderBack}
         onToggleChat={handleToggleHeaderChat}
       />
@@ -1152,6 +1188,7 @@ const App = () => {
         {!showSettings && !effectiveShowTagManager && !effectiveShowEmojiPanel && (
           <HistoryFilterBar
             t={t} search={search} typeFilter={typeFilter} count={filteredHistory.length}
+            fileCategoryLabel={activeFileCategory ? fileCategoryName(activeFileCategory, t) : undefined}
             hasMore={effectiveHasMore} status={historyPending ? "loading" : historyFailed ? "error" : "ready"}
             loadingMore={isLoadingMore} limited={requestState.limited} hasSavedData={history.length > 0}
             onClearSearch={() => applySearchImmediately("")} onClearType={clearTypeFilter}
@@ -1176,7 +1213,7 @@ const App = () => {
           saveSetting={saveSetting}
           filteredHistory={filteredHistory}
           suppressEmptyState={historyPending || historyFailed || hasActiveFilters}
-          scrollContextKey={JSON.stringify([search, typeFilter, compactMode, theme, language, privacyProtection, richTextSnapshotPreview])}
+          scrollContextKey={JSON.stringify([search, typeFilter, extensionsKey, compactMode, theme, language, privacyProtection, richTextSnapshotPreview])}
           scrollLayoutVersion={appSettings}
           search={search}
           pinnedItems={pinnedItems}
@@ -1195,6 +1232,7 @@ const App = () => {
           onScrollTop={handleScrollTop}
         />
       </main>
+      </div>
 
       <ToastContainer toasts={toasts} />
 

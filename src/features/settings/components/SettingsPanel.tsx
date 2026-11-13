@@ -798,6 +798,8 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 collapsed={collapsedGroups['data']}
                 onToggle={() => toggleGroup('data')}
                 dataPath={dataPath}
+                appSettings={appSettings}
+                saveAppSetting={saveAppSetting}
             />
 
             <div className="settings-group">
@@ -808,7 +810,6 @@ const SettingsPanel = (props: SettingsPanelProps) => {
                 >
                     <div style={{ minWidth: 0, textAlign: "left" }}>
                         <h3 style={{ margin: 0 }}>{t("advanced_settings")}</h3>
-                        <div className="settings-subpage-note">{t("advanced_settings_entry_desc")}</div>
                     </div>
                     <ChevronRight size={16} />
                 </button>

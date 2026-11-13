@@ -1,11 +1,4 @@
-.tag-picker { margin-top: 8px; min-width: 0; font-size: 12px; color: var(--text-primary); }
-.tag-picker-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; min-width: 0; }
-.tag-picker-input-wrap { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 80px; max-width: 260px; padding: 5px 8px; background: var(--bg-input); border: 1px solid var(--line-soft); border-radius: 8px; color: var(--text-secondary); }
-.tag-picker-input-wrap:focus-within { border-color: var(--accent-color); box-shadow: 0 0 0 1px var(--accent-color); }
-.tag-picker-input-wrap input { flex: 1; min-width: 0; width: 100%; padding: 0; border: 0; outline: none; background: transparent; color: var(--text-primary); font: inherit; }
-.tag-picker-input-wrap input::-webkit-search-cancel-button { -webkit-appearance: none; }
-.tag-picker-input-wrap button { display: flex; border: 0; padding: 2px; background: transparent; color: var(--text-secondary); cursor: pointer; }
-.tag-picker-count { flex-shrink: 0; font-variant-numeric: tabular-nums; color: var(--text-secondary); font-size: 11px; }
+.tag-picker { margin-top: 6px; min-width: 0; font-size: 12px; color: var(--text-primary); }
 .tag-picker-options { display: flex; gap: 6px; padding: 3px 2px 6px; overflow-x: auto; scrollbar-width: thin; }
 .tag-picker-option { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; max-width: min(220px, 80%); padding: 5px 8px; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--bg-element); color: var(--text-primary); font: inherit; cursor: pointer; }
 .tag-picker-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -13,4 +6,4 @@
 .tag-picker-option:hover { box-shadow: inset 0 0 0 1px var(--accent-color); }
 .tag-picker button:focus-visible { outline: 2px solid var(--accent-color); outline-offset: 2px; }
 .tag-picker-empty { margin: 4px 0 0; padding: 5px 2px; color: var(--text-secondary); line-height: 1.5; }
-.tags-dropdown .tag-chip { max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font: inherit; }
+

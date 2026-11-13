@@ -453,6 +453,7 @@ pub async fn register_received_file(
             is_external: false,
             pinned_order: 0,
             file_preview_exists: true,
+            note: String::new(),
         };
         if settings.persistent.load(Ordering::Relaxed) {
             let db_state = app_handle.state::<DbState>();

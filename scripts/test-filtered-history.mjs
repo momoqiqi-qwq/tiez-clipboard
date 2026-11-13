@@ -8,10 +8,14 @@ import ts from 'typescript';
 const searchModule = {};
 vm.runInNewContext(ts.transpileModule(
   readFileSync(new URL('../src/shared/lib/historySearch.ts', import.meta.url), 'utf8'),
-  { compilerOptions: { module: ts.ModuleKind.CommonJS } }
+  { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }
 ).outputText, { exports: searchModule });
 
 const source = readFileSync(new URL('../src/shared/hooks/useFilteredHistory.ts', import.meta.url), 'utf8');
+const fileModule = {};
+vm.runInNewContext(ts.transpileModule(readFileSync(new URL('../src/shared/lib/fileCategories.ts', import.meta.url), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+}).outputText, { exports: fileModule });
 let cursor = 0;
 const slots = [];
 const calls = [];
@@ -26,15 +30,16 @@ const useMemo = (fn, deps) => {
 };
 const exports = {};
 vm.runInNewContext(ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS }
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
 }).outputText, { exports, require: name => {
   if (name === '../lib/historySearch') return searchModule;
+  if (name === '../lib/fileCategories') return fileModule;
   assert.equal(name, 'react');
   return { useMemo };
 }});
-const render = (history, search = '', typeFilter = null) => {
+const render = (history, search = '', typeFilter = null, fileExtensions = undefined) => {
   cursor = 0;
-  return exports.useFilteredHistory({ history, search, typeFilter });
+  return exports.useFilteredHistory({ history, search, typeFilter, fileExtensions });
 };
 const ids = items => Array.from(items, item => item.id);
 const history = Object.freeze([
@@ -70,3 +75,12 @@ assert.deepEqual(ids(render(updated)), [4, 5, 2, 7, 3, 1, 6]);
 assert.equal(calls[0], 2, 'Changed history must invalidate ordering');
 assert.deepEqual(ids(render([])), []);
 console.log('PASS: ordering, ties, content/app/tag/type filters, missing fields, immutable input, memo reuse and invalidation');
+const files = [
+  {id: 1, timestamp: 1, content_type: 'file', content: 'C:\\report.PDF', tags: ['Work']},
+  {id: 2, timestamp: 2, content_type: 'file', content: 'C:\\note.docx', tags: ['Work']},
+  {id: 3, timestamp: 3, content_type: 'text', content: 'report.pdf', tags: ['Work']}
+];
+assert.deepEqual(ids(render(files, '', null, ['pdf'])), [1]);
+assert.deepEqual(ids(render(files, 'tag:Work', null, ['pdf'])), [1]);
+assert.deepEqual(ids(render(files, 'absent', null, ['pdf'])), []);
+console.log('PASS: extension filter combines with keyword and tag conditions');

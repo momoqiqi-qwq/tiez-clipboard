@@ -99,7 +99,7 @@ const AdvancedSettingsGroup = ({
     const [selectedSourceId, setSelectedSourceId] = useState("global");
     const [expandedRuleIndex, setExpandedRuleIndex] = useState<number | null>(0);
     const [draftRules, setDraftRules] = useState<EditableRule[]>(parseRules(cleanupRules));
-    const [sidebarWidth, setSidebarWidth] = useState(120);
+    const [sidebarWidth, setSidebarWidth] = useState(150);
     const [sidebarHeight, setSidebarHeight] = useState(180);
     const [isResizing, setIsResizing] = useState(false);
     const [isStacked, setIsStacked] = useState(false);
@@ -178,16 +178,27 @@ const AdvancedSettingsGroup = ({
 
     // App icons fetching removed for minimalist style
 
+    // Layout switches on the workbench's own width, not the window's: the panel can be
+    // narrower than the window, and a 120px column is unusable well before 340px.
     useEffect(() => {
-        const mediaQuery = window.matchMedia("(max-width: 340px)");
+        const element = workbenchRef.current;
+        if (!element) return;
+
         const updateLayoutMode = () => {
-            setIsStacked(mediaQuery.matches);
+            setIsStacked(element.getBoundingClientRect().width < 520);
         };
 
         updateLayoutMode();
-        mediaQuery.addEventListener("change", updateLayoutMode);
 
-        return () => mediaQuery.removeEventListener("change", updateLayoutMode);
+        if (typeof ResizeObserver === "undefined") {
+            window.addEventListener("resize", updateLayoutMode);
+            return () => window.removeEventListener("resize", updateLayoutMode);
+        }
+
+        const observer = new ResizeObserver(updateLayoutMode);
+        observer.observe(element);
+
+        return () => observer.disconnect();
     }, []);
 
     useEffect(() => {
@@ -203,7 +214,7 @@ const AdvancedSettingsGroup = ({
                 return;
             }
 
-            const nextWidth = Math.min(Math.max(event.clientX - bounds.left, 80), 280);
+            const nextWidth = Math.min(Math.max(event.clientX - bounds.left, 118), 300);
             setSidebarWidth(nextWidth);
         };
 
@@ -355,6 +366,18 @@ const AdvancedSettingsGroup = ({
         setSearchText("");
     };
 
+    const activePolicy = selectedTarget && selectedTarget.kind === "app"
+        ? appCleanupPolicies.find((policy) => (
+            selectedTarget.policyId ? policy.id === selectedTarget.policyId : policy.appPath === selectedTarget.appPath
+        ))
+        : undefined;
+    const isIgnoreMode = activePolicy?.action === "ignore";
+    const editorSubtitle = isIgnoreMode
+        ? t("app_cleanup_policy_ignore")
+        : draftRules.length > 0
+            ? `${draftRules.length} ${t("advanced_rule_count_suffix")}`
+            : t("advanced_no_rules");
+
     return (
         <div className="settings-subpage advanced-settings-page">
             {/* Header is handled by AppHeader */}
@@ -399,11 +422,19 @@ const AdvancedSettingsGroup = ({
 
                     <div className="advanced-target-list">
                         {filteredTargets.map((target) => (
-                            <button
+                            <div
                                 key={target.id}
-                                type="button"
+                                role="button"
+                                tabIndex={0}
+                                aria-pressed={selectedTarget?.id === target.id}
                                 className={`advanced-target-item ${selectedTarget?.id === target.id ? "active" : ""}`}
                                 onClick={() => setSelectedSourceId(target.id)}
+                                onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === " ") {
+                                        event.preventDefault();
+                                        setSelectedSourceId(target.id);
+                                    }
+                                }}
                             >
                                 <span className="advanced-target-meta">
                                     <span className="advanced-target-name">{target.label}</span>
@@ -426,7 +457,7 @@ const AdvancedSettingsGroup = ({
                                         <Trash2 size={14} />
                                     </button>
                                 )}
-                            </button>
+                            </div>
                         ))}
                     </div>
                 </aside>
@@ -440,12 +471,18 @@ const AdvancedSettingsGroup = ({
 
                 <div className="advanced-editor">
                     <div className="advanced-editor-toolbar">
-                        {selectedTarget?.kind === "global" || (appCleanupPolicies.find(p => p.id === selectedTarget.policyId || p.appPath === selectedTarget.appPath)?.action !== "ignore") ? (
+                        <div className="advanced-editor-info">
+                            <div className="advanced-editor-title">
+                                {selectedTarget?.label ?? t("advanced_target_global")}
+                            </div>
+                            <div className="advanced-editor-subtitle">{editorSubtitle}</div>
+                        </div>
+                        {!isIgnoreMode && (
                             <button type="button" className="btn-icon advanced-add-rule-btn" onClick={addRule}>
                                 <Plus size={14} />
                                 <span>{t("advanced_add_rule")}</span>
                             </button>
-                        ) : null}
+                        )}
                     </div>
 
                     {selectedTarget?.kind === "app" && (
@@ -453,32 +490,30 @@ const AdvancedSettingsGroup = ({
                             <div className="advanced-action-info">
                                 <span className="advanced-action-label">记录此应用的内容？</span>
                                 <span className="advanced-action-hint">
-                                    {appCleanupPolicies.find(p => p.id === selectedTarget.policyId || p.appPath === selectedTarget.appPath)?.action === "ignore"
+                                    {isIgnoreMode
                                         ? "当前已关闭记录，来自该应用的剪贴板内容将被忽略"
                                         : "当前已开启记录，您可以点击上方按钮添加清洗或拦截规则"
                                     }
                                 </span>
                             </div>
-                            <button 
-                                type="button" 
-                                className={`advanced-action-switch ${appCleanupPolicies.find(p => p.id === selectedTarget.policyId || p.appPath === selectedTarget.appPath)?.action !== "ignore" ? "active" : ""}`}
+                            <button
+                                type="button"
+                                className={`advanced-action-switch ${isIgnoreMode ? "" : "active"}`}
                                 onClick={toggleTargetAction}
+                                aria-pressed={!isIgnoreMode}
                             >
                                 <span className="advanced-action-switch-track">
                                     <span className="advanced-action-switch-thumb" />
                                 </span>
                                 <span className="advanced-action-switch-label">
-                                    {appCleanupPolicies.find(p => p.id === selectedTarget.policyId || p.appPath === selectedTarget.appPath)?.action !== "ignore"
-                                        ? "开启"
-                                        : "关闭"
-                                    }
+                                    {isIgnoreMode ? "关闭" : "开启"}
                                 </span>
                             </button>
                         </div>
                     )}
 
                     <div className="advanced-rule-list">
-                        {selectedTarget?.kind === "app" && appCleanupPolicies.find(p => p.id === selectedTarget.policyId || p.appPath === selectedTarget.appPath)?.action === "ignore" ? (
+                        {selectedTarget?.kind === "app" && isIgnoreMode ? (
                             <div className="advanced-empty-state ignore-mode">
                                 <div className="advanced-empty-title">已停止记录</div>
                                 <div className="advanced-empty-text">

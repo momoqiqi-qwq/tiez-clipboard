@@ -1,17 +1,20 @@
 import { useMemo } from "react";
 import { parseHistorySearch } from "../lib/historySearch";
+import { matchesFileExtensions } from "../lib/fileCategories";
 import type { ClipboardEntry } from "../types";
 
 interface UseFilteredHistoryOptions {
   history: ClipboardEntry[];
   search: string;
   typeFilter: string | null;
+  fileExtensions?: string[];
 }
 
 export const useFilteredHistory = ({
   history,
   search,
-  typeFilter
+  typeFilter,
+  fileExtensions
 }: UseFilteredHistoryOptions) => {
   // Search and type changes do not change ordering. Never sort the state array.
   const sortedHistory = useMemo(() => {
@@ -32,9 +35,10 @@ export const useFilteredHistory = ({
     const { tagOnly: isTagSearch, normalizedTerm: effectiveSearch } = parseHistorySearch(search);
 
     // Reuse the sorted array when no filtering is needed.
-    if (!typeFilter && !effectiveSearch) return sortedHistory;
+    if (!typeFilter && !effectiveSearch && !fileExtensions?.length) return sortedHistory;
 
     return sortedHistory.filter((item) => {
+      if (fileExtensions?.length && !matchesFileExtensions(item, fileExtensions)) return false;
       if (typeFilter && item.content_type !== typeFilter) {
         return false;
       }
@@ -50,5 +54,5 @@ export const useFilteredHistory = ({
         item.tags?.some((tag) => tag.toLowerCase().includes(effectiveSearch))
       );
     });
-  }, [sortedHistory, search, typeFilter]);
+  }, [sortedHistory, search, typeFilter, fileExtensions]);
 };

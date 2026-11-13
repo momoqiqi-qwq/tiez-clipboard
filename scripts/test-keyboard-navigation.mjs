@@ -41,7 +41,7 @@ function harness() {
 }
 function keyEvent(key, targetName = 'INPUT', composition = {}) {
   return { key, isComposing: false, keyCode: 0, ...composition,
-    target: { tagName: targetName, classList: { contains: name => targetName === 'INPUT' && name === 'search-input' } },
+    target: { tagName: targetName, closest: () => null, classList: { contains: name => targetName === 'INPUT' && name === 'search-input' } },
     prevented: false, stopped: false,
     preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } };
 }
@@ -78,3 +78,15 @@ for (const composition of [{ isComposing: true }, { keyCode: 229 }]) {
   assert.deepEqual(h.selections, [1], 'Normal arrows still navigate'); h.cleanup();
 }
 console.log('PASS: IME keys cannot hide/blur/paste/navigate; ordinary Escape, Enter and arrows retain their behavior');
+
+for (const key of ['Escape', 'Enter', 'ArrowUp', 'ArrowDown']) {
+  const h = harness(), event = keyEvent(key, 'BUTTON');
+  event.target.closest = () => ({});
+  await h.keydown(event);
+  assert.equal(h.copies.length, 0);
+  assert.equal(h.selections.length, 0);
+  assert.equal(h.invocations.filter(call => call.command === 'hide_window_cmd').length, 0);
+  assert.equal(event.prevented, false, 'Category dialog owns its keyboard events');
+  h.cleanup();
+}
+console.log('PASS: category dialog cannot paste, navigate clipboard history or hide the app');

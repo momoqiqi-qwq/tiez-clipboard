@@ -519,6 +519,29 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // Local configuration backup defaults. Clipboard data stays in SQLite; these snapshots
+    // contain settings only and can be imported safely across installations.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.config_backup_enabled', 'false')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.config_backup_interval_min', '60')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.config_backup_dir', '')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.config_backup_on_exit', 'true')",
+        [],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('app.config_backup_last_export_ms', '0')",
+        [],
+    );
+
     Ok(())
 }
 

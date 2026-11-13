@@ -15,4 +15,6 @@ export interface ClipboardEntry {
   is_external?: boolean;
   pinned_order?: number;
   file_preview_exists?: boolean;
+  /** Free-form user annotation; "" or undefined means none. */
+  note?: string;
 }

@@ -35,7 +35,6 @@ export const useAppState = (): AppState => {
   const [search, setSearch] = useState("");
   const [isComposing, setIsComposing] = useState(false);
   const [searchIsFocused, setSearchIsFocused] = useState(false);
-  const [showTagFilter, setShowTagFilter] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [showEmojiPanel, setShowEmojiPanel] = useState(false);
   const [emojiFavorites, setEmojiFavorites] = useState<string[]>([]);
@@ -204,8 +203,6 @@ export const useAppState = (): AppState => {
     setIsComposing,
     searchIsFocused,
     setSearchIsFocused,
-    showTagFilter,
-    setShowTagFilter,
     tagInput,
     setTagInput,
     showEmojiPanel,

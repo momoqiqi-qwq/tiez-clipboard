@@ -701,6 +701,7 @@ fn start_services(app: &App, s: &StartupSettings, app_handle: AppHandle) {
     crate::services::clipboard::start_clipboard_monitor(app_handle.clone());
     crate::services::mqtt_sub::start_mqtt_client(app_handle.clone());
     crate::services::cloud_sync::start_cloud_sync_client(app_handle.clone());
+    crate::services::config_backup::start_scheduler(app_handle.clone());
     start_edge_docking_monitor(app_handle.clone());
 
     let db_state = app.state::<DbState>();

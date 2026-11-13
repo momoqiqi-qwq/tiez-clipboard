@@ -247,6 +247,7 @@ pub async fn handle_text(
                 is_external: false,
                 pinned_order: 0,
                 file_preview_exists: true,
+                note: String::new(),
             };
             db_state.repo.save(&entry, None).map_err(|e| {
                 rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
@@ -278,6 +279,7 @@ pub async fn handle_text(
                 is_external: false,
                 pinned_order: 0,
                 file_preview_exists: true,
+                note: String::new(),
             };
 
             if let Ok(mut session) = session_hist.0.lock() {
