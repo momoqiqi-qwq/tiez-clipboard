@@ -1,4 +1,4 @@
-<details>
+<details open>
 <summary><b>目录</b></summary>
 
 - [Theme Gallery](#theme-gallery)
@@ -9,6 +9,8 @@
 - [Community & Support](#community-support)
 
 </details>
+
+---
 
 ---
 
