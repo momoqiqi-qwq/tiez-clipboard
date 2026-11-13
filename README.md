@@ -10,6 +10,8 @@
 
 </details>
 
+---
+
 <p align="left">
   <img src="docs/images/logo.png" width="32" vertical-align="middle" />
   <b>Making fragmented information flow effortlessly.</b>
