@@ -6,9 +6,11 @@
 - [Key Features](#key-features)
 - [Installation](#installation)
 - [Star History](#star-history)
-- [Community & Support](#community-support)
+- [Community & Support](#community--support)
 
 </details>
+
+---
 
 ---
 
