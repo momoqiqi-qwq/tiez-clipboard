@@ -1,3 +1,15 @@
+<details>
+<summary><b>目录</b></summary>
+
+- [Theme Gallery](#theme-gallery)
+- [Why TieZ?](#why-tiez)
+- [Key Features](#key-features)
+- [Installation](#installation)
+- [Star History](#star-history)
+- [Community & Support](#community-support)
+
+</details>
+
 <p align="left">
   <img src="docs/images/logo.png" width="32" vertical-align="middle" />
   <b>Making fragmented information flow effortlessly.</b>
